@@ -177,6 +177,8 @@ body, .gradio-container {
   font-size: 13px;
   white-space: pre;
   cursor: pointer;
+  position: relative;
+  overflow: visible;
 }
 
 .topk-list {
@@ -277,6 +279,40 @@ body, .gradio-container {
 .heat-token:hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 14px rgba(185, 28, 28, 0.15);
+}
+
+.token-hover-value {
+  position: absolute;
+  left: 50%;
+  top: -28px;
+  transform: translate(-50%, 6px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  background: #0f172a;
+  color: #f8fafc;
+  border-radius: 8px;
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.2;
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.28);
+  z-index: 20;
+}
+
+.token-hover-value::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -4px;
+  transform: translateX(-50%);
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 4px solid #0f172a;
+}
+
+.heat-token:hover .token-hover-value {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 
 .token-target {
@@ -848,6 +884,7 @@ def render_heatmap_strip(
         else:
             tooltip_parts.append("Final: {:.6f}".format(float(score)))
         tooltip_text = html.escape(" | ".join(tooltip_parts), quote=True)
+        percent_text = format_percent(float(score))
         chips.append(
             "<span class='{}' data-role='heatmap' data-token-index='{}' data-heatmap-token-index='{}' title='{}' style='background:{};'>".format(
                 " ".join(classes),
@@ -857,9 +894,21 @@ def render_heatmap_strip(
                 score_to_color(float(score), max_score),
             )
             + sanitize_token(token)
+            + "<span class='token-hover-value'>{}</span>".format(percent_text)
             + "</span>"
         )
     return "<div class='heatmap'>{}</div>".format("".join(chips))
+
+
+def format_percent(score: float) -> str:
+    percent = float(score) * 100.0
+    if percent <= 0:
+        return "0%"
+    if percent < 0.01:
+        return "<0.01%"
+    if percent < 1:
+        return "{:.3f}%".format(percent)
+    return "{:.2f}%".format(percent)
 
 
 def render_topk(
@@ -886,13 +935,7 @@ def render_topk(
 
     items = []
     for rank, idx in enumerate(top_indices, start=1):
-        percent = float(score_vec[idx]) * 100.0
-        if percent < 0.01:
-            score_text = "{:.4f}%".format(percent)
-        elif percent < 1:
-            score_text = "{:.3f}%".format(percent)
-        else:
-            score_text = "{:.2f}%".format(percent)
+        score_text = format_percent(float(score_vec[idx]))
         items.append(
             "<div class='topk-item' data-role='topk' data-token-index='{}' title='Click to highlight and scroll'>".format(
                 idx
@@ -1055,24 +1098,80 @@ def prepare_prompt(
     )
 
 
-def sync_target_index(target_index: Any, tokens: List[str]) -> Tuple:
+def sync_target_index(
+    target_index: Any,
+    tokens: List[str],
+    final_scores: List[float],
+    mt_scores: List[float],
+    s_scores: List[float],
+    kl_scores: List[float],
+    segment_ranges: Dict[str, Tuple[int, int]],
+    highlight_index: Any,
+) -> Tuple:
+    try:
+        hi = int(highlight_index) if highlight_index is not None else None
+    except (TypeError, ValueError):
+        hi = None
     if not tokens:
         return (
             target_index,
             render_token_preview([], None),
             "Selected target: (none)",
             format_status("error", "No tokens available. Build prompt preview first."),
+            render_heatmap_strip([], np.array([]), None),
+            render_heatmap_strip([], np.array([]), None),
+            render_heatmap_strip([], np.array([]), None),
+            render_heatmap_strip([], np.array([]), None),
         )
     try:
         idx = int(target_index) if target_index is not None else len(tokens) - 1
     except (TypeError, ValueError):
         idx = len(tokens) - 1
     idx = max(0, min(idx, len(tokens) - 1))
+    if hi is not None and (hi < 0 or hi >= len(tokens)):
+        hi = None
+
+    final_arr = np.asarray(final_scores, dtype=np.float64)
+    mt_arr = np.asarray(mt_scores, dtype=np.float64)
+    s_arr = np.asarray(s_scores, dtype=np.float64)
+    kl_arr = np.asarray(kl_scores, dtype=np.float64)
     return (
         idx,
         render_token_preview(tokens, idx),
         format_selected(tokens, idx),
-        format_status("idle", "Manual highlight index updated."),
+        format_status("idle", "Target token updated."),
+        render_heatmap_strip(
+            tokens,
+            final_arr,
+            hi,
+            tooltips=build_common_tooltips(final_arr, mt_arr, s_arr, kl_arr),
+            segment_ranges=segment_ranges,
+            target_index=idx,
+        ),
+        render_heatmap_strip(
+            tokens,
+            mt_arr,
+            hi,
+            tooltips={i: {"MT": value} for i, value in enumerate(mt_arr.tolist())},
+            segment_ranges=segment_ranges,
+            target_index=idx,
+        ),
+        render_heatmap_strip(
+            tokens,
+            s_arr,
+            hi,
+            tooltips={i: {"S": value} for i, value in enumerate(s_arr.tolist())},
+            segment_ranges=segment_ranges,
+            target_index=idx,
+        ),
+        render_heatmap_strip(
+            tokens,
+            kl_arr,
+            hi,
+            tooltips={i: {"I": value} for i, value in enumerate(kl_arr.tolist())},
+            segment_ranges=segment_ranges,
+            target_index=idx,
+        ),
     )
 
 
@@ -1779,8 +1878,26 @@ def build_demo() -> gr.Blocks:
 
         target_index.change(
             sync_target_index,
-            inputs=[target_index, tokens_state],
-            outputs=[target_index, token_preview, selected_display, status],
+            inputs=[
+                target_index,
+                tokens_state,
+                final_scores_state,
+                mt_scores_state,
+                s_scores_state,
+                kl_scores_state,
+                segment_ranges_state,
+                highlight_index,
+            ],
+            outputs=[
+                target_index,
+                token_preview,
+                selected_display,
+                status,
+                final_heatmap,
+                mt_heatmap,
+                s_heatmap,
+                kl_heatmap,
+            ],
         )
 
         highlight_index.change(
