@@ -590,13 +590,10 @@ def compute_kl_information(
     input_ids: torch.Tensor,
     target_pos: int,
     mask_strategy: str,
-    return_metadata: bool = False,
-) -> Any:
+) -> np.ndarray:
     seq_len = input_ids.shape[1]
     kl_scores = torch.zeros(seq_len, device=input_ids.device)
     if target_pos <= 0:
-        if return_metadata:
-            return kl_scores.cpu().numpy(), ""
         return kl_scores.cpu().numpy()
 
     pred_pos = target_pos - 1
@@ -614,34 +611,23 @@ def compute_kl_information(
     if replace_id is None:
         replace_id = 0
 
-    metadata_note = ""
     for pos in range(target_pos):
-        try:
-            if mask_strategy == "drop":
-                masked_ids = torch.cat([input_ids[:, :pos], input_ids[:, pos + 1 :]], dim=1)
-                masked_target_pos = target_pos - 1
-                masked_pred_pos = masked_target_pos - 1
-                if masked_pred_pos < 0:
-                    continue
-                with torch.no_grad():
-                    masked_logits = model(masked_ids, use_cache=False).logits[
-                        0, masked_pred_pos, :
-                    ]
-            elif mask_strategy == "zero_embed":
-                with torch.no_grad():
-                    embeds = model.get_input_embeddings()(input_ids).clone()
-                    embeds[:, pos, :] = 0
-                    masked_logits = model(inputs_embeds=embeds, use_cache=False).logits[
-                        0, pred_pos, :
-                    ]
-            else:
-                masked_ids = input_ids.clone()
-                masked_ids[0, pos] = replace_id
-                with torch.no_grad():
-                    masked_logits = model(masked_ids, use_cache=False).logits[0, pred_pos, :]
-        except Exception:
-            # Anncy: Comment zero-embed fallback uses unk replacement when direct embedding masking fails.
-            metadata_note = "zero_embed->unk fallback"
+        if mask_strategy == "drop":
+            masked_ids = torch.cat([input_ids[:, :pos], input_ids[:, pos + 1 :]], dim=1)
+            masked_target_pos = target_pos - 1
+            masked_pred_pos = masked_target_pos - 1
+            if masked_pred_pos < 0:
+                continue
+            with torch.no_grad():
+                masked_logits = model(masked_ids, use_cache=False).logits[0, masked_pred_pos, :]
+        elif mask_strategy == "zero_embed":
+            with torch.no_grad():
+                embeds = model.get_input_embeddings()(input_ids).clone()
+                embeds[:, pos, :] = 0
+                masked_logits = model(inputs_embeds=embeds, use_cache=False).logits[
+                    0, pred_pos, :
+                ]
+        else:
             masked_ids = input_ids.clone()
             masked_ids[0, pos] = replace_id
             with torch.no_grad():
@@ -658,9 +644,55 @@ def compute_kl_information(
     score_sum = kl_scores[:target_pos].sum()
     if score_sum > 1e-10:
         kl_scores[:target_pos] = kl_scores[:target_pos] / score_sum
-    if return_metadata:
-        return kl_scores.cpu().numpy(), metadata_note
     return kl_scores.cpu().numpy()
+
+
+def compute_hessian_sensitivity_forward(
+    model: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    target_pos: int,
+    epsilon: float = 0.05,
+) -> np.ndarray:
+    seq_len = input_ids.shape[1]
+    scores = torch.zeros(seq_len, device=input_ids.device, dtype=torch.float32)
+    if target_pos <= 0:
+        return scores.cpu().numpy()
+
+    pred_pos = target_pos - 1
+    target_token = input_ids[0, target_pos]
+    with torch.no_grad():
+        base_embeds = model.get_input_embeddings()(input_ids)
+        base_logits = model(inputs_embeds=base_embeds, use_cache=False).logits[0, pred_pos, :]
+        base_log_prob = torch.log_softmax(base_logits, dim=-1)[target_token]
+
+    plus_embeds = base_embeds.clone()
+    minus_embeds = base_embeds.clone()
+    eps = float(max(epsilon, 1e-4))
+    for pos in range(target_pos):
+        with torch.no_grad():
+            base_vec = base_embeds[:, pos, :]
+            norm = torch.norm(base_vec, dim=-1, keepdim=True).clamp(min=1e-6)
+            delta = (eps * base_vec / norm).to(base_embeds.dtype)
+            plus_embeds[:, pos, :] = base_vec + delta
+            minus_embeds[:, pos, :] = base_vec - delta
+
+            plus_logits = model(inputs_embeds=plus_embeds, use_cache=False).logits[0, pred_pos, :]
+            minus_logits = model(inputs_embeds=minus_embeds, use_cache=False).logits[
+                0, pred_pos, :
+            ]
+            lp_plus = torch.log_softmax(plus_logits, dim=-1)[target_token]
+            lp_minus = torch.log_softmax(minus_logits, dim=-1)[target_token]
+            second_order = torch.abs(lp_plus - 2 * base_log_prob + lp_minus) / (eps ** 2)
+            scores[pos] = second_order.to(torch.float32)
+
+            plus_embeds[:, pos, :] = base_vec
+            minus_embeds[:, pos, :] = base_vec
+
+    scores[target_pos:] = 0
+    total = scores[:target_pos].sum()
+    if total > 1e-10:
+        scores[:target_pos] = scores[:target_pos] / total
+    return scores.cpu().numpy()
 
 
 def combine_attr(
@@ -786,12 +818,19 @@ def render_topk(tokens: List[str], scores: np.ndarray, k: int = 12) -> str:
 
     items = []
     for rank, idx in enumerate(top_indices, start=1):
+        percent = float(score_vec[idx]) * 100.0
+        if percent < 0.01:
+            score_text = "{:.4f}%".format(percent)
+        elif percent < 1:
+            score_text = "{:.3f}%".format(percent)
+        else:
+            score_text = "{:.2f}%".format(percent)
         items.append(
             "<div class='topk-item' data-role='topk' data-token-index='{}' title='Click to highlight and scroll'>".format(
                 idx
             )
             + "<span>#{:d} {} (idx {})</span>".format(rank, sanitize_token(tokens[idx]), idx)
-            + "<span>{:.2f}%</span>".format(float(score_vec[idx]) * 100.0)
+            + "<span>{}</span>".format(score_text)
             + "</div>"
         )
     return "<div class='topk-list'>{}</div>".format("".join(items))
@@ -1075,29 +1114,46 @@ def run_attribution(
     target_pos = len(full_ids) - 1
     input_ids = torch.tensor([full_ids], dtype=torch.long, device=attributor.device)
 
-    mt_gate = attributor.compute_attention_rollout(input_ids, target_pos).detach().cpu().numpy()
-    hessian_note = ""
-    # Anncy: Comment TODO replace gradient proxy with full Hessian HVP estimator used in paper experiments.
     try:
-        hessian_s = (
-            attributor.compute_gradient_sensitivity(input_ids, target_pos)
+        mt_gate = (
+            attributor.compute_attention_rollout(input_ids, target_pos)
+            .to(torch.float32)
             .detach()
             .cpu()
             .numpy()
         )
     except Exception as exc:  # noqa: BLE001
-        # Anncy: Comment fallback keeps demo responsive when gradient dtype/backward is unsupported.
-        hessian_s = mt_gate.copy()
-        hessian_note = "S fallback to MT ({})".format(type(exc).__name__)
+        return run_return(
+            segment_ranges=prompt_bundle["segments"],
+            full_prompt=prompt_bundle["full_text"],
+            status_text=format_status("error", "MT computation failed: {}".format(exc)),
+        )
 
-    kl_i, kl_note = compute_kl_information(
-        attributor.model,
-        tokenizer,
-        input_ids,
-        target_pos,
-        mask_strategy,
-        return_metadata=True,
-    )
+    # Anncy: Comment this demo uses forward-only finite-difference curvature to avoid backend
+    # backward dtype limitations; paper-grade Hessian estimators can be wired in backend later.
+    try:
+        hessian_s = compute_hessian_sensitivity_forward(attributor.model, input_ids, target_pos)
+    except Exception as exc:  # noqa: BLE001
+        return run_return(
+            segment_ranges=prompt_bundle["segments"],
+            full_prompt=prompt_bundle["full_text"],
+            status_text=format_status("error", "Hessian S computation failed: {}".format(exc)),
+        )
+
+    try:
+        kl_i = compute_kl_information(
+            attributor.model,
+            tokenizer,
+            input_ids,
+            target_pos,
+            mask_strategy,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return run_return(
+            segment_ranges=prompt_bundle["segments"],
+            full_prompt=prompt_bundle["full_text"],
+            status_text=format_status("error", "KL I computation failed: {}".format(exc)),
+        )
     final_scores = combine_attr(mt_gate, hessian_s, kl_i, float(beta), float(gamma))
 
     display_tokens = [
@@ -1150,10 +1206,6 @@ def run_attribution(
     metadata = "Model: {} | Quality: {} | Mask: {} | beta={:.2f} | gamma={:.2f} | Latency: {} ms".format(
         model_label, quality, mask_strategy, float(beta), float(gamma), latency_ms
     )
-    if hessian_note:
-        metadata += " | {}".format(hessian_note)
-    if kl_note:
-        metadata += " | KL note: {}".format(kl_note)
 
     export_payload = {
         "full_prompt": prompt_bundle["full_text"],
