@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 import torch
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
