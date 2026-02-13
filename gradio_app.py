@@ -147,6 +147,8 @@ body, .gradio-container {
   cursor: pointer;
   white-space: pre;
   transition: all 0.15s ease;
+  position: relative;
+  overflow: visible;
 }
 
 .token-chip:hover {
@@ -158,6 +160,28 @@ body, .gradio-container {
   border-color: var(--accent-strong);
   background: #e9f1ff;
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+}
+
+.token-order {
+  position: absolute;
+  top: -18px;
+  right: -4px;
+  background: #0f172a;
+  color: #f8fafc;
+  border-radius: 999px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.2;
+  opacity: 0;
+  transform: translateY(3px);
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  z-index: 15;
+}
+
+.token-chip:hover .token-order {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .token-target {
@@ -429,6 +453,9 @@ function() {
     const role = token.getAttribute('data-role');
     if (role === 'preview') {
       setInputValue('target-index', idx);
+      setInputValue('highlight-index', idx);
+      pulseToken(idx);
+      return;
     }
     if (role === 'topk' || role === 'heatmap') {
       setInputValue('highlight-index', idx);
@@ -534,10 +561,12 @@ def render_token_preview(tokens: List[str], selected_index: Optional[int]) -> st
             classes.append("token-selected")
         token_html = sanitize_token(token)
         chips.append(
-            "<span class='{}' data-role='preview' data-token-index='{}' title='Index {}'>".format(
+            "<span class='{}' data-role='preview' data-token-index='{}' title='Index {} (click to select)'>".format(
                 " ".join(classes), idx, idx
             )
             + token_html
+            + "<span class='token-order'>#{}".format(idx)
+            + "</span>"
             + "</span>"
         )
     return "<div class='token-preview'>{}</div>".format("".join(chips))
