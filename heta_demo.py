@@ -5,6 +5,13 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
 
+MODEL_OPTIONS = {
+    "Qwen2.5-3B": "Qwen/Qwen2.5-3B-Instruct",
+    "GPT-J-6B": "EleutherAI/gpt-j-6B",
+    "Phi-3-Medium-4K-Instruct (14B)": "microsoft/Phi-3-medium-4k-instruct",
+    "Llama-3.1-70B": "meta-llama/Llama-3.1-70B-Instruct",
+}
+
 
 class HETAAttributor:
     def __init__(self, model, tokenizer, device="cuda"):
@@ -120,7 +127,12 @@ class HETAAttributor:
 
 def main():
     parser = argparse.ArgumentParser(description="HETA Token Attribution Demo")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B", help="Model name")
+    parser.add_argument(
+        "--model",
+        default="Qwen2.5-3B",
+        choices=list(MODEL_OPTIONS.keys()),
+        help="Model option",
+    )
     parser.add_argument("--text", default=None, help="Input text")
     parser.add_argument(
         "--target-pos", type=int, default=None, help="Target token position"
@@ -130,13 +142,14 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Loading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model_id = MODEL_OPTIONS[args.model]
+    print(f"Loading {args.model} ({model_id})...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
+        model_id,
         torch_dtype=torch.bfloat16,
         device_map=args.device,
         trust_remote_code=True,
