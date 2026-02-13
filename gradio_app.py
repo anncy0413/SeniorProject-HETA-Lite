@@ -407,6 +407,17 @@ def get_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def get_compute_dtype(device: str) -> torch.dtype:
+    if device != "cuda":
+        return torch.float32
+    try:
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+    except Exception:
+        pass
+    return torch.float16
+
+
 def get_model_id(model_choice: str) -> str:
     if model_choice in MODEL_OPTIONS:
         return MODEL_OPTIONS[model_choice]
@@ -435,7 +446,7 @@ def load_tokenizer(model_name: str = DEFAULT_MODEL_ID) -> AutoTokenizer:
 @lru_cache(maxsize=1)
 def load_attributor(model_name: str = DEFAULT_MODEL_ID) -> HETAAttributor:
     device = get_device()
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    dtype = get_compute_dtype(device)
     tokenizer = load_tokenizer(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -1065,10 +1076,20 @@ def run_attribution(
     input_ids = torch.tensor([full_ids], dtype=torch.long, device=attributor.device)
 
     mt_gate = attributor.compute_attention_rollout(input_ids, target_pos).detach().cpu().numpy()
+    hessian_note = ""
     # Anncy: Comment TODO replace gradient proxy with full Hessian HVP estimator used in paper experiments.
-    hessian_s = (
-        attributor.compute_gradient_sensitivity(input_ids, target_pos).detach().cpu().numpy()
-    )
+    try:
+        hessian_s = (
+            attributor.compute_gradient_sensitivity(input_ids, target_pos)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Anncy: Comment fallback keeps demo responsive when gradient dtype/backward is unsupported.
+        hessian_s = mt_gate.copy()
+        hessian_note = "S fallback to MT ({})".format(type(exc).__name__)
+
     kl_i, kl_note = compute_kl_information(
         attributor.model,
         tokenizer,
@@ -1129,6 +1150,8 @@ def run_attribution(
     metadata = "Model: {} | Quality: {} | Mask: {} | beta={:.2f} | gamma={:.2f} | Latency: {} ms".format(
         model_label, quality, mask_strategy, float(beta), float(gamma), latency_ms
     )
+    if hessian_note:
+        metadata += " | {}".format(hessian_note)
     if kl_note:
         metadata += " | KL note: {}".format(kl_note)
 
