@@ -516,10 +516,23 @@ def build_segmented_prompt(
     narrative = (narrative or "").strip()
     evidence = (evidence or "").strip()
     question = (question or "").strip()
+    prefix_text = {
+        "narrative": "[NarrativeQA]",
+        "evidence": "[SciQ]",
+        "question": "[Question]",
+    }
+    segment_content = {
+        "narrative": narrative,
+        "evidence": evidence,
+        "question": question,
+    }
     segment_text = {
-        "narrative": "[NarrativeQA] {}".format(narrative),
-        "evidence": "[SciQ] {}".format(evidence),
-        "question": "[Question] {}".format(question),
+        key: (
+            "{} {}".format(prefix_text[key], segment_content[key]).strip()
+            if segment_content[key]
+            else prefix_text[key]
+        )
+        for key in prefix_text
     }
     full_text = SEGMENT_SEPARATOR.join(
         [segment_text["narrative"], segment_text["evidence"], segment_text["question"]]
@@ -532,12 +545,42 @@ def build_segmented_prompt(
     evidence_ids = tokenizer(segment_text["evidence"], add_special_tokens=False).input_ids
     question_ids = tokenizer(segment_text["question"], add_special_tokens=False).input_ids
 
-    narrative_start = 0
-    narrative_end = len(narrative_ids)
-    evidence_start = narrative_end + len(separator_ids)
-    evidence_end = evidence_start + len(evidence_ids)
-    question_start = evidence_end + len(separator_ids)
-    question_end = question_start + len(question_ids)
+    narrative_prefix_ids = tokenizer(
+        "{} ".format(prefix_text["narrative"]), add_special_tokens=False
+    ).input_ids
+    evidence_prefix_ids = tokenizer(
+        "{} ".format(prefix_text["evidence"]), add_special_tokens=False
+    ).input_ids
+    question_prefix_ids = tokenizer(
+        "{} ".format(prefix_text["question"]), add_special_tokens=False
+    ).input_ids
+
+    narrative_content_ids = tokenizer(narrative, add_special_tokens=False).input_ids
+    evidence_content_ids = tokenizer(evidence, add_special_tokens=False).input_ids
+    question_content_ids = tokenizer(question, add_special_tokens=False).input_ids
+
+    narrative_segment_start = 0
+    narrative_segment_end = len(narrative_ids)
+    evidence_segment_start = len(narrative_ids) + len(separator_ids)
+    evidence_segment_end = evidence_segment_start + len(evidence_ids)
+    question_segment_start = evidence_segment_start + len(evidence_ids) + len(separator_ids)
+    question_segment_end = question_segment_start + len(question_ids)
+
+    narrative_start = narrative_segment_start + len(narrative_prefix_ids)
+    narrative_end = narrative_start + len(narrative_content_ids)
+
+    evidence_start = evidence_segment_start + len(evidence_prefix_ids)
+    evidence_end = evidence_start + len(evidence_content_ids)
+
+    question_start = question_segment_start + len(question_prefix_ids)
+    question_end = question_start + len(question_content_ids)
+
+    narrative_start = min(narrative_start, narrative_segment_end)
+    narrative_end = min(max(narrative_start, narrative_end), narrative_segment_end)
+    evidence_start = min(evidence_start, evidence_segment_end)
+    evidence_end = min(max(evidence_start, evidence_end), evidence_segment_end)
+    question_start = min(question_start, question_segment_end)
+    question_end = min(max(question_start, question_end), question_segment_end)
 
     return {
         "full_text": full_text,
@@ -650,16 +693,16 @@ def compute_kl_information(
 def compute_hessian_sensitivity_forward(
     model: AutoModelForCausalLM,
     input_ids: torch.Tensor,
-    target_pos: int,
+    target_token_id: int,
     epsilon: float = 0.05,
 ) -> np.ndarray:
     seq_len = input_ids.shape[1]
     scores = torch.zeros(seq_len, device=input_ids.device, dtype=torch.float32)
-    if target_pos <= 0:
+    if seq_len <= 1:
         return scores.cpu().numpy()
 
-    pred_pos = target_pos - 1
-    target_token = input_ids[0, target_pos]
+    pred_pos = seq_len - 1
+    target_token = int(target_token_id)
     with torch.no_grad():
         base_embeds = model.get_input_embeddings()(input_ids)
         base_logits = model(inputs_embeds=base_embeds, use_cache=False).logits[0, pred_pos, :]
@@ -668,7 +711,7 @@ def compute_hessian_sensitivity_forward(
     plus_embeds = base_embeds.clone()
     minus_embeds = base_embeds.clone()
     eps = float(max(epsilon, 1e-4))
-    for pos in range(target_pos):
+    for pos in range(seq_len):
         with torch.no_grad():
             base_vec = base_embeds[:, pos, :]
             norm = torch.norm(base_vec, dim=-1, keepdim=True).clamp(min=1e-6)
@@ -688,10 +731,9 @@ def compute_hessian_sensitivity_forward(
             plus_embeds[:, pos, :] = base_vec
             minus_embeds[:, pos, :] = base_vec
 
-    scores[target_pos:] = 0
-    total = scores[:target_pos].sum()
+    total = scores.sum()
     if total > 1e-10:
-        scores[:target_pos] = scores[:target_pos] / total
+        scores = scores / total
     return scores.cpu().numpy()
 
 
@@ -710,6 +752,21 @@ def combine_attr(
     if normalizer > 1e-12:
         final = final / normalizer
     return final.astype(np.float64)
+
+
+def normalize_on_indices(scores: np.ndarray, keep_indices: List[int]) -> np.ndarray:
+    score_vec = np.asarray(scores, dtype=np.float64).copy()
+    if score_vec.size == 0:
+        return score_vec
+    mask = np.zeros(score_vec.shape[0], dtype=bool)
+    for idx in keep_indices:
+        if 0 <= int(idx) < score_vec.shape[0]:
+            mask[int(idx)] = True
+    score_vec[~mask] = 0.0
+    total = score_vec.sum()
+    if total > 1e-12:
+        score_vec = score_vec / total
+    return score_vec
 
 
 def compute_segment_mass(scores: np.ndarray, segment_ranges: Dict[str, Tuple[int, int]]) -> Dict[str, float]:
@@ -805,13 +862,24 @@ def render_heatmap_strip(
     return "<div class='heatmap'>{}</div>".format("".join(chips))
 
 
-def render_topk(tokens: List[str], scores: np.ndarray, k: int = 12) -> str:
+def render_topk(
+    tokens: List[str], scores: np.ndarray, k: int = 12, allowed_indices: Optional[List[int]] = None
+) -> str:
     score_vec = np.asarray(scores, dtype=np.float64).tolist()
     if not tokens or not score_vec:
         return "<div class='status-box'>Run attribution to see top contributors.</div>"
 
     score_vec = score_vec[: len(tokens)]
-    indices = sorted(range(len(score_vec)), key=lambda idx: score_vec[idx], reverse=True)
+    if allowed_indices is None:
+        candidate_indices = list(range(len(score_vec)))
+    else:
+        candidate_indices = [
+            int(idx)
+            for idx in allowed_indices
+            if 0 <= int(idx) < len(score_vec)
+        ]
+        candidate_indices = sorted(set(candidate_indices))
+    indices = sorted(candidate_indices, key=lambda idx: score_vec[idx], reverse=True)
     top_indices = [idx for idx in indices if score_vec[idx] > 0][:k]
     if not top_indices:
         return "<div class='status-box'>No influential tokens available for this target.</div>"
@@ -1110,13 +1178,15 @@ def run_attribution(
         k = 1
     k = max(1, min(k, len(answer_ids)))
 
-    full_ids = prompt_ids + answer_ids[:k]
-    target_pos = len(full_ids) - 1
-    input_ids = torch.tensor([full_ids], dtype=torch.long, device=attributor.device)
+    context_ids = prompt_ids + answer_ids[: k - 1]
+    target_token_id = int(answer_ids[k - 1])
+    input_ids = torch.tensor([context_ids], dtype=torch.long, device=attributor.device)
+    logical_target_pos = len(context_ids)
 
     try:
+        mt_target_idx = max(0, input_ids.shape[1] - 1)
         mt_gate = (
-            attributor.compute_attention_rollout(input_ids, target_pos)
+            attributor.compute_attention_rollout(input_ids, mt_target_idx)
             .to(torch.float32)
             .detach()
             .cpu()
@@ -1132,7 +1202,9 @@ def run_attribution(
     # Anncy: Comment this demo uses forward-only finite-difference curvature to avoid backend
     # backward dtype limitations; paper-grade Hessian estimators can be wired in backend later.
     try:
-        hessian_s = compute_hessian_sensitivity_forward(attributor.model, input_ids, target_pos)
+        hessian_s = compute_hessian_sensitivity_forward(
+            attributor.model, input_ids, target_token_id
+        )
     except Exception as exc:  # noqa: BLE001
         return run_return(
             segment_ranges=prompt_bundle["segments"],
@@ -1145,7 +1217,7 @@ def run_attribution(
             attributor.model,
             tokenizer,
             input_ids,
-            target_pos,
+            logical_target_pos,
             mask_strategy,
         )
     except Exception as exc:  # noqa: BLE001
@@ -1154,18 +1226,39 @@ def run_attribution(
             full_prompt=prompt_bundle["full_text"],
             status_text=format_status("error", "KL I computation failed: {}".format(exc)),
         )
+    content_indices: List[int] = []
+    for start, end in prompt_bundle["segments"].values():
+        lo = max(0, int(start))
+        hi = min(len(context_ids), int(end))
+        if hi > lo:
+            content_indices.extend(range(lo, hi))
+    if len(context_ids) > len(prompt_ids):
+        content_indices.extend(range(len(prompt_ids), len(context_ids)))
+    content_indices = sorted(set(content_indices))
+
+    mt_gate = normalize_on_indices(mt_gate, content_indices)
+    hessian_s = normalize_on_indices(hessian_s, content_indices)
+    kl_i = normalize_on_indices(kl_i, content_indices)
     final_scores = combine_attr(mt_gate, hessian_s, kl_i, float(beta), float(gamma))
+    final_scores = normalize_on_indices(final_scores, content_indices)
+
+    display_ids = context_ids + [target_token_id]
+    target_pos = len(display_ids) - 1
+    mt_display = np.concatenate([mt_gate, np.array([0.0], dtype=np.float32)])
+    s_display = np.concatenate([hessian_s, np.array([0.0], dtype=np.float32)])
+    i_display = np.concatenate([kl_i, np.array([0.0], dtype=np.float32)])
+    final_display = np.concatenate([final_scores, np.array([0.0], dtype=np.float64)])
 
     display_tokens = [
-        tokenizer.decode([token_id], skip_special_tokens=False) for token_id in full_ids
+        tokenizer.decode([token_id], skip_special_tokens=False) for token_id in display_ids
     ]
     preview_html = render_token_preview(display_tokens, target_pos)
     selected_text = format_selected(display_tokens, target_pos)
 
-    tooltip_map = build_common_tooltips(final_scores, mt_gate, hessian_s, kl_i)
+    tooltip_map = build_common_tooltips(final_display, mt_display, s_display, i_display)
     final_strip = render_heatmap_strip(
         display_tokens,
-        final_scores,
+        final_display,
         None,
         tooltips=tooltip_map,
         segment_ranges=prompt_bundle["segments"],
@@ -1173,31 +1266,36 @@ def run_attribution(
     )
     mt_strip = render_heatmap_strip(
         display_tokens,
-        mt_gate,
+        mt_display,
         None,
-        tooltips={idx: {"MT": value} for idx, value in enumerate(mt_gate.tolist())},
+        tooltips={idx: {"MT": value} for idx, value in enumerate(mt_display.tolist())},
         segment_ranges=prompt_bundle["segments"],
         target_index=target_pos,
     )
     s_strip = render_heatmap_strip(
         display_tokens,
-        hessian_s,
+        s_display,
         None,
-        tooltips={idx: {"S": value} for idx, value in enumerate(hessian_s.tolist())},
+        tooltips={idx: {"S": value} for idx, value in enumerate(s_display.tolist())},
         segment_ranges=prompt_bundle["segments"],
         target_index=target_pos,
     )
     i_strip = render_heatmap_strip(
         display_tokens,
-        kl_i,
+        i_display,
         None,
-        tooltips={idx: {"I": value} for idx, value in enumerate(kl_i.tolist())},
+        tooltips={idx: {"I": value} for idx, value in enumerate(i_display.tolist())},
         segment_ranges=prompt_bundle["segments"],
         target_index=target_pos,
     )
 
-    topk_html = render_topk(display_tokens[:target_pos], final_scores[:target_pos], k=12)
-    segment_mass = compute_segment_mass(final_scores, prompt_bundle["segments"])
+    topk_html = render_topk(
+        display_tokens[:target_pos],
+        final_display[:target_pos],
+        k=12,
+        allowed_indices=content_indices,
+    )
+    segment_mass = compute_segment_mass(final_display, prompt_bundle["segments"])
     segment_mass_md = format_segment_mass_markdown(segment_mass)
     answer_tokens_html = render_answer_tokens(answer_tokens, k)
 
@@ -1228,10 +1326,10 @@ def run_attribution(
         },
         "tokens": display_tokens,
         "scores": {
-            "final": [float(value) for value in final_scores.tolist()],
-            "mt": [float(value) for value in mt_gate.tolist()],
-            "hessian_s": [float(value) for value in hessian_s.tolist()],
-            "kl_i": [float(value) for value in kl_i.tolist()],
+            "final": [float(value) for value in final_display.tolist()],
+            "mt": [float(value) for value in mt_display.tolist()],
+            "hessian_s": [float(value) for value in s_display.tolist()],
+            "kl_i": [float(value) for value in i_display.tolist()],
         },
         "segment_mass": segment_mass,
         "latency_ms": latency_ms,
@@ -1240,10 +1338,10 @@ def run_attribution(
     status_detail = "Attribution complete for answer onset token k={}.".format(k)
     return run_return(
         tokens=display_tokens,
-        final_scores=[float(value) for value in final_scores.tolist()],
-        mt_scores=[float(value) for value in mt_gate.tolist()],
-        s_scores=[float(value) for value in hessian_s.tolist()],
-        kl_scores=[float(value) for value in kl_i.tolist()],
+        final_scores=[float(value) for value in final_display.tolist()],
+        mt_scores=[float(value) for value in mt_display.tolist()],
+        s_scores=[float(value) for value in s_display.tolist()],
+        kl_scores=[float(value) for value in i_display.tolist()],
         segment_ranges=prompt_bundle["segments"],
         full_prompt=prompt_bundle["full_text"],
         target_index=int(target_pos),
