@@ -12,6 +12,8 @@ from heta_demo import HETAAttributor, MODEL_OPTIONS
 
 SEGMENT_SEPARATOR = " <s> "
 MAX_ANSWER_TOKENS = 16
+DEFAULT_MODEL_LABEL = next(iter(MODEL_OPTIONS.keys()))
+DEFAULT_MODEL_ID = MODEL_OPTIONS[DEFAULT_MODEL_LABEL]
 
 
 def get_device() -> str:
@@ -34,7 +36,7 @@ def get_model_id(model_choice: str) -> str:
         return MODEL_OPTIONS[model_choice]
     if model_choice in MODEL_OPTIONS.values():
         return model_choice
-    return MODEL_OPTIONS["Qwen2.5-3B"]
+    return DEFAULT_MODEL_ID
 
 
 def get_model_label(model_choice: str) -> str:
@@ -43,7 +45,7 @@ def get_model_label(model_choice: str) -> str:
     for label, model_id in MODEL_OPTIONS.items():
         if model_id == model_choice:
             return label
-    return "Qwen2.5-3B"
+    return DEFAULT_MODEL_LABEL
 
 
 @lru_cache(maxsize=8)
@@ -452,4 +454,3 @@ def run_one_example(
 
 
 __all__ = ["run_one_example", "MODEL_OPTIONS"]
-
