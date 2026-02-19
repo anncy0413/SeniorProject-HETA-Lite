@@ -10,3 +10,10 @@ __pycache__/
 *.pywzz
 *.pyzzz
 *.pywzzz
+# local datasets (do not commit)
+/dataset/*.json
+/dataset/*.jsonl
+
+# local datasets (do not commit)
+/dataset/*.json
+/dataset/*.jsonl

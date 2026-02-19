@@ -24,7 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run HETA faithfulness batch test on HotpotQA.")
     parser.add_argument("--input_jsonl", required=True, help="Path to converted HETA-style JSONL.")
     parser.add_argument("--output_dir", required=True, help="Directory for JSONL/CSV/summary outputs.")
-    parser.add_argument("--model", default="Qwen2.5-3B", help="Model label or model id.")
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Model label or model id. If omitted, project default model is used.",
+    )
     parser.add_argument("--beta", type=float, default=0.7)
     parser.add_argument("--gamma", type=float, default=0.7)
     parser.add_argument(
@@ -194,7 +198,7 @@ def main() -> None:
     args = parse_args()
     if args.num_workers != 1:
         print("[warn] Only num_workers=1 is currently supported; forcing serial execution.")
-    if args.model not in MODEL_OPTIONS and args.model not in MODEL_OPTIONS.values():
+    if args.model and args.model not in MODEL_OPTIONS and args.model not in MODEL_OPTIONS.values():
         print("[warn] Model is not in known dropdown options; trying it as raw model id.")
 
     set_seed(args.seed)

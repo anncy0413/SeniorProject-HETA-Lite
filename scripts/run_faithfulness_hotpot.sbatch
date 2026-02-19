@@ -1,16 +1,20 @@
-#SBATCH --job-name=heta_faith
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
-
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/zhoukexin/SeniorProject-HETA-Lite}"
-INPUT_JSONL="${INPUT_JSONL:-/home/zhoukexin/SeniorProject-HETA-Lite/data/heta_hotpot_dev.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/zhoukexin/SeniorProject-HETA-Lite/outputs/faithfulness_dev}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-3B}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+INPUT_JSONL="${INPUT_JSONL:-${1:-}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${2:-}}"
+
+if [[ -z "${INPUT_JSONL}" || -z "${OUTPUT_DIR}" ]]; then
+  echo "Usage:"
+  echo "  sbatch scripts/run_faithfulness_hotpot.sbatch <input_jsonl> <output_dir>"
+  echo "Or:"
+  echo "  sbatch --export=ALL,INPUT_JSONL=...,OUTPUT_DIR=... scripts/run_faithfulness_hotpot.sbatch"
+  exit 1
+fi
+
+MODEL_NAME="${MODEL_NAME:-}"
 BETA="${BETA:-0.7}"
 GAMMA="${GAMMA:-0.7}"
 MASKING="${MASKING:-zero_embed}"
@@ -27,16 +31,24 @@ exec 2> >(tee -a "${OUTPUT_DIR}/logs/run_${SLURM_JOB_ID}.err" >&2)
 source "${REPO_ROOT}/.venv/bin/activate"
 cd "${REPO_ROOT}"
 
-python scripts/run_faithfulness_hotpot.py \
-  --input_jsonl "${INPUT_JSONL}" \
-  --output_dir "${OUTPUT_DIR}" \
-  --model "${MODEL_NAME}" \
-  --beta "${BETA}" \
-  --gamma "${GAMMA}" \
-  --masking "${MASKING}" \
-  --quality "${QUALITY}" \
-  --target_k "${TARGET_K}" \
-  --max_examples "${MAX_EXAMPLES}" \
-  --seed "${SEED}" \
-  --num_workers 1 \
+CMD=(
+  python scripts/run_faithfulness_hotpot.py
+  --input_jsonl "${INPUT_JSONL}"
+  --output_dir "${OUTPUT_DIR}"
+  --beta "${BETA}"
+  --gamma "${GAMMA}"
+  --masking "${MASKING}"
+  --quality "${QUALITY}"
+  --target_k "${TARGET_K}"
+  --max_examples "${MAX_EXAMPLES}"
+  --seed "${SEED}"
+  --num_workers 1
   --save_every "${SAVE_EVERY}"
+)
+
+if [[ -n "${MODEL_NAME}" ]]; then
+  CMD+=(--model "${MODEL_NAME}")
+fi
+
+"${CMD[@]}"
+
