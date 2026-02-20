@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import time
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from heta_demo import HETAAttributor, MODEL_OPTIONS
@@ -14,6 +16,9 @@ SEGMENT_SEPARATOR = " <s> "
 MAX_ANSWER_TOKENS = 16
 DEFAULT_MODEL_LABEL = next(iter(MODEL_OPTIONS.keys()))
 DEFAULT_MODEL_ID = MODEL_OPTIONS[DEFAULT_MODEL_LABEL]
+DEFAULT_HVP_SAMPLES = 1
+DEFAULT_MAX_CONTEXT_TOKENS = 384
+ANSWER_CUE = "\nAnswer:"
 
 
 def get_device() -> str:
@@ -61,13 +66,23 @@ def load_attributor(model_name: str) -> HETAAttributor:
     device = get_device()
     dtype = get_compute_dtype(device)
     tokenizer = load_tokenizer(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-        attn_implementation="eager",
-    )
+    common_kwargs = {
+        "device_map": device,
+        "trust_remote_code": True,
+        "attn_implementation": "eager",
+    }
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            **common_kwargs,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            **common_kwargs,
+        )
     model.eval()
     return HETAAttributor(model, tokenizer, device)
 
@@ -100,53 +115,113 @@ def build_segmented_prompt(
         [segment_text["narrative"], segment_text["evidence"], segment_text["question"]]
     )
 
-    separator_ids = tokenizer(SEGMENT_SEPARATOR, add_special_tokens=False).input_ids
-    narrative_ids = tokenizer(segment_text["narrative"], add_special_tokens=False).input_ids
-    evidence_ids = tokenizer(segment_text["evidence"], add_special_tokens=False).input_ids
-    question_ids = tokenizer(segment_text["question"], add_special_tokens=False).input_ids
+    sep_len = len(SEGMENT_SEPARATOR)
+    narrative_seg_start_char = 0
+    narrative_seg_end_char = len(segment_text["narrative"])
+    evidence_seg_start_char = narrative_seg_end_char + sep_len
+    evidence_seg_end_char = evidence_seg_start_char + len(segment_text["evidence"])
+    question_seg_start_char = evidence_seg_end_char + sep_len
+    question_seg_end_char = question_seg_start_char + len(segment_text["question"])
 
-    narrative_prefix_ids = tokenizer(
-        "{} ".format(prefix_text["narrative"]), add_special_tokens=False
-    ).input_ids
-    evidence_prefix_ids = tokenizer(
-        "{} ".format(prefix_text["evidence"]), add_special_tokens=False
-    ).input_ids
-    question_prefix_ids = tokenizer(
-        "{} ".format(prefix_text["question"]), add_special_tokens=False
-    ).input_ids
+    narrative_content_start_char = narrative_seg_start_char + len(prefix_text["narrative"])
+    evidence_content_start_char = evidence_seg_start_char + len(prefix_text["evidence"])
+    question_content_start_char = question_seg_start_char + len(prefix_text["question"])
+    if narrative:
+        narrative_content_start_char += 1
+    if evidence:
+        evidence_content_start_char += 1
+    if question:
+        question_content_start_char += 1
+    narrative_content_end_char = narrative_content_start_char + len(narrative)
+    evidence_content_end_char = evidence_content_start_char + len(evidence)
+    question_content_end_char = question_content_start_char + len(question)
 
-    narrative_content_ids = tokenizer(narrative, add_special_tokens=False).input_ids
-    evidence_content_ids = tokenizer(evidence, add_special_tokens=False).input_ids
-    question_content_ids = tokenizer(question, add_special_tokens=False).input_ids
+    def approx_spans() -> Dict[str, Tuple[int, int]]:
+        separator_ids = tokenizer(SEGMENT_SEPARATOR, add_special_tokens=False).input_ids
+        narrative_ids = tokenizer(segment_text["narrative"], add_special_tokens=False).input_ids
+        evidence_ids = tokenizer(segment_text["evidence"], add_special_tokens=False).input_ids
+        question_ids = tokenizer(segment_text["question"], add_special_tokens=False).input_ids
 
-    narrative_segment_start = 0
-    narrative_segment_end = len(narrative_ids)
-    evidence_segment_start = len(narrative_ids) + len(separator_ids)
-    evidence_segment_end = evidence_segment_start + len(evidence_ids)
-    question_segment_start = evidence_segment_start + len(evidence_ids) + len(separator_ids)
-    question_segment_end = question_segment_start + len(question_ids)
+        narrative_prefix_ids = tokenizer(
+            "{} ".format(prefix_text["narrative"]), add_special_tokens=False
+        ).input_ids
+        evidence_prefix_ids = tokenizer(
+            "{} ".format(prefix_text["evidence"]), add_special_tokens=False
+        ).input_ids
+        question_prefix_ids = tokenizer(
+            "{} ".format(prefix_text["question"]), add_special_tokens=False
+        ).input_ids
 
-    narrative_start = narrative_segment_start + len(narrative_prefix_ids)
-    narrative_end = narrative_start + len(narrative_content_ids)
-    evidence_start = evidence_segment_start + len(evidence_prefix_ids)
-    evidence_end = evidence_start + len(evidence_content_ids)
-    question_start = question_segment_start + len(question_prefix_ids)
-    question_end = question_start + len(question_content_ids)
+        narrative_content_ids = tokenizer(narrative, add_special_tokens=False).input_ids
+        evidence_content_ids = tokenizer(evidence, add_special_tokens=False).input_ids
+        question_content_ids = tokenizer(question, add_special_tokens=False).input_ids
 
-    narrative_start = min(narrative_start, narrative_segment_end)
-    narrative_end = min(max(narrative_start, narrative_end), narrative_segment_end)
-    evidence_start = min(evidence_start, evidence_segment_end)
-    evidence_end = min(max(evidence_start, evidence_end), evidence_segment_end)
-    question_start = min(question_start, question_segment_end)
-    question_end = min(max(question_start, question_end), question_segment_end)
+        narrative_segment_start = 0
+        narrative_segment_end = len(narrative_ids)
+        evidence_segment_start = len(narrative_ids) + len(separator_ids)
+        evidence_segment_end = evidence_segment_start + len(evidence_ids)
+        question_segment_start = evidence_segment_start + len(evidence_ids) + len(separator_ids)
+        question_segment_end = question_segment_start + len(question_ids)
 
-    return {
-        "full_text": full_text,
-        "segments": {
+        narrative_start = narrative_segment_start + len(narrative_prefix_ids)
+        narrative_end = narrative_start + len(narrative_content_ids)
+        evidence_start = evidence_segment_start + len(evidence_prefix_ids)
+        evidence_end = evidence_start + len(evidence_content_ids)
+        question_start = question_segment_start + len(question_prefix_ids)
+        question_end = question_start + len(question_content_ids)
+
+        narrative_start = min(narrative_start, narrative_segment_end)
+        narrative_end = min(max(narrative_start, narrative_end), narrative_segment_end)
+        evidence_start = min(evidence_start, evidence_segment_end)
+        evidence_end = min(max(evidence_start, evidence_end), evidence_segment_end)
+        question_start = min(question_start, question_segment_end)
+        question_end = min(max(question_start, question_end), question_segment_end)
+        return {
             "narrative": (narrative_start, narrative_end),
             "evidence": (evidence_start, evidence_end),
             "question": (question_start, question_end),
-        },
+        }
+
+    spans: Dict[str, Tuple[int, int]]
+    use_offsets = bool(getattr(tokenizer, "is_fast", False))
+    if use_offsets:
+        try:
+            encoded = tokenizer(
+                full_text, add_special_tokens=False, return_offsets_mapping=True
+            )
+            offsets = encoded.get("offset_mapping", [])
+
+            def char_to_token_span(start_char: int, end_char: int) -> Tuple[int, int]:
+                if end_char <= start_char:
+                    return (0, 0)
+                idxs = [
+                    idx
+                    for idx, (s, e) in enumerate(offsets)
+                    if int(e) > int(start_char) and int(s) < int(end_char)
+                ]
+                if not idxs:
+                    return (0, 0)
+                return (int(idxs[0]), int(idxs[-1]) + 1)
+
+            spans = {
+                "narrative": char_to_token_span(
+                    narrative_content_start_char, narrative_content_end_char
+                ),
+                "evidence": char_to_token_span(
+                    evidence_content_start_char, evidence_content_end_char
+                ),
+                "question": char_to_token_span(
+                    question_content_start_char, question_content_end_char
+                ),
+            }
+        except Exception:
+            spans = approx_spans()
+    else:
+        spans = approx_spans()
+
+    return {
+        "full_text": full_text,
+        "segments": spans,
     }
 
 
@@ -183,6 +258,40 @@ def generate_answer_tokens(
         "answer_tokens": answer_tokens,
         "answer_text": answer_text.strip(),
     }
+
+
+def _is_structural_token(token_text: str) -> bool:
+    t = (token_text or "").strip()
+    if not t:
+        return True
+    return re.search(r"[A-Za-z0-9]", t) is None
+
+
+def _first_generated_content_index(answer_tokens: List[str]) -> int:
+    for idx, tok in enumerate(answer_tokens):
+        if not _is_structural_token(tok):
+            return idx
+    return 0
+
+
+def _first_gold_answer_token_id(
+    tokenizer: AutoTokenizer, answer_text: str, with_prefix_space: bool = True
+) -> int | None:
+    answer = (answer_text or "").strip()
+    if not answer:
+        return None
+    variants = [answer]
+    if with_prefix_space:
+        variants = [f" {answer}", answer]
+    for text in variants:
+        ids = tokenizer(text, add_special_tokens=False).input_ids
+        if not ids:
+            continue
+        tok = tokenizer.decode([int(ids[0])], skip_special_tokens=False)
+        if _is_structural_token(tok):
+            continue
+        return int(ids[0])
+    return None
 
 
 def compute_kl_information(
@@ -248,47 +357,183 @@ def compute_kl_information(
     return kl_scores.cpu().numpy()
 
 
-def compute_hessian_sensitivity_forward(
+def compute_semantic_flow_mt(
+    model: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    target_pos: int,
+    target_token_id: int | None = None,
+) -> np.ndarray:
+    seq_len = input_ids.shape[1]
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            output_attentions=True,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+    attentions = outputs.attentions
+    hidden_states = outputs.hidden_states
+    if not attentions:
+        mt = torch.ones(seq_len, device=input_ids.device, dtype=torch.float32)
+        mt = mt / mt.sum().clamp(min=1e-12)
+        return mt.detach().cpu().numpy()
+
+    def _get_decoder_layers(model_obj: AutoModelForCausalLM) -> List[Any]:
+        if hasattr(model_obj, "model") and hasattr(model_obj.model, "layers"):
+            return list(model_obj.model.layers)
+        if hasattr(model_obj, "transformer") and hasattr(model_obj.transformer, "h"):
+            return list(model_obj.transformer.h)
+        return []
+
+    def _get_attn_module(layer_obj: Any) -> Any:
+        for name in ("self_attn", "attn", "attention"):
+            if hasattr(layer_obj, name):
+                return getattr(layer_obj, name)
+        return None
+
+    def _get_linear(mod: Any, names: List[str]) -> Any:
+        for name in names:
+            if hasattr(mod, name):
+                obj = getattr(mod, name)
+                if hasattr(obj, "weight"):
+                    return obj
+        return None
+
+    def _projected_value_norms(layer_idx: int, head_count: int) -> torch.Tensor:
+        # Try to follow paper term ||V_i^{(l,h)} W_O^{(l,h)}||_1. If module access fails,
+        # fallback to per-token hidden-state norm replicated across heads.
+        if hidden_states is None or layer_idx >= len(hidden_states):
+            base = torch.ones(seq_len, device=input_ids.device, dtype=torch.float32)
+            return base.unsqueeze(0).repeat(head_count, 1)
+
+        layers = _get_decoder_layers(model)
+        if not layers or layer_idx >= len(layers):
+            base = hidden_states[layer_idx].squeeze(0).to(torch.float32).norm(p=1, dim=-1)
+            return base.unsqueeze(0).repeat(head_count, 1)
+
+        attn_mod = _get_attn_module(layers[layer_idx])
+        if attn_mod is None:
+            base = hidden_states[layer_idx].squeeze(0).to(torch.float32).norm(p=1, dim=-1)
+            return base.unsqueeze(0).repeat(head_count, 1)
+
+        v_proj = _get_linear(attn_mod, ["v_proj", "value", "v"])
+        o_proj = _get_linear(attn_mod, ["o_proj", "out_proj", "c_proj", "dense"])
+        if v_proj is None or o_proj is None:
+            base = hidden_states[layer_idx].squeeze(0).to(torch.float32).norm(p=1, dim=-1)
+            return base.unsqueeze(0).repeat(head_count, 1)
+        with torch.no_grad():
+            h_in = hidden_states[layer_idx].to(v_proj.weight.dtype)
+            v_all = v_proj(h_in)  # [1, T, D_v]
+            if v_all.ndim != 3 or v_all.shape[1] != seq_len:
+                base = hidden_states[layer_idx].squeeze(0).to(torch.float32).norm(p=1, dim=-1)
+                return base.unsqueeze(0).repeat(head_count, 1)
+
+            v_dim = int(v_all.shape[-1])
+            num_heads = int(
+                getattr(attn_mod, "num_heads", 0)
+                or getattr(attn_mod, "n_heads", 0)
+                or getattr(attn_mod, "num_attention_heads", 0)
+                or head_count
+            )
+            num_kv_heads = int(getattr(attn_mod, "num_key_value_heads", num_heads))
+            num_kv_heads = max(1, num_kv_heads)
+            if v_dim % num_kv_heads != 0:
+                base = hidden_states[layer_idx].squeeze(0).to(torch.float32).norm(p=1, dim=-1)
+                return base.unsqueeze(0).repeat(head_count, 1)
+
+            head_dim = v_dim // num_kv_heads
+            v_heads = v_all.view(1, seq_len, num_kv_heads, head_dim)
+            if num_kv_heads != num_heads:
+                repeat = max(1, num_heads // num_kv_heads)
+                v_heads = v_heads.repeat_interleave(repeat, dim=2)
+            if v_heads.shape[2] < num_heads:
+                repeat_extra = max(1, (num_heads + v_heads.shape[2] - 1) // v_heads.shape[2])
+                v_heads = v_heads.repeat_interleave(repeat_extra, dim=2)
+            v_heads = v_heads[:, :, :num_heads, :].squeeze(0)  # [T, H, Dh]
+
+            o_w = o_proj.weight.detach().to(torch.float32)  # [D_out, D_in]
+            in_dim = int(o_w.shape[1])
+            heads_from_o = max(1, in_dim // head_dim)
+            h_eff = min(int(v_heads.shape[1]), heads_from_o, head_count)
+            v_heads = v_heads[:, :h_eff, :].to(torch.float32)
+            o_slice = o_w[:, : h_eff * head_dim]
+            o_heads = o_slice.view(o_w.shape[0], h_eff, head_dim).permute(1, 2, 0)  # [H, Dh, D_out]
+            projected = torch.einsum("thd,hdm->thm", v_heads, o_heads)
+            norms = projected.abs().sum(dim=-1).transpose(0, 1)  # [H, T]
+            if h_eff < head_count:
+                pad = norms.mean(dim=0, keepdim=True).repeat(head_count - h_eff, 1)
+                norms = torch.cat([norms, pad], dim=0)
+            return norms[:head_count, :]
+
+    head_count = int(attentions[0].shape[1])
+    eye = torch.eye(seq_len, device=input_ids.device, dtype=torch.float32).unsqueeze(0)
+    rollout = eye.repeat(head_count, 1, 1)
+    mt = torch.zeros(seq_len, device=input_ids.device, dtype=torch.float32)
+
+    for layer_idx, layer_attn in enumerate(attentions):
+        attn_h = layer_attn.squeeze(0).to(torch.float32)
+        if attn_h.ndim != 3:
+            continue
+        if attn_h.shape[0] != head_count:
+            # Align unexpected head count to stable shape.
+            h_cur = int(attn_h.shape[0])
+            if h_cur <= 0:
+                continue
+            if h_cur < head_count:
+                rep = max(1, (head_count + h_cur - 1) // h_cur)
+                attn_h = attn_h.repeat(rep, 1, 1)[:head_count]
+            else:
+                attn_h = attn_h[:head_count]
+        attn_h = 0.5 * attn_h + 0.5 * eye
+        attn_h = attn_h / attn_h.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        rollout = torch.matmul(attn_h, rollout)
+        path_mass_h = rollout[:, target_pos, :].clamp(min=0)  # [H, T]
+        value_norm_h = _projected_value_norms(layer_idx, head_count).clamp(min=1e-10)
+        mt = mt + (path_mass_h * value_norm_h).sum(dim=0) / float(head_count)
+
+    mt[target_pos:] = 0
+    mt = mt.clamp(min=0)
+    mt_sum = mt.sum()
+    if mt_sum > 1e-12:
+        mt = mt / mt_sum
+    return mt.detach().cpu().numpy()
+
+
+def compute_hessian_sensitivity_hvp(
     model: AutoModelForCausalLM,
     input_ids: torch.Tensor,
     target_token_id: int,
-    epsilon: float = 0.05,
+    pred_pos: int,
+    num_samples: int = DEFAULT_HVP_SAMPLES,
 ) -> np.ndarray:
     seq_len = input_ids.shape[1]
     scores = torch.zeros(seq_len, device=input_ids.device, dtype=torch.float32)
-    if seq_len <= 1:
+    if seq_len <= 1 or num_samples <= 0:
         return scores.cpu().numpy()
 
-    pred_pos = seq_len - 1
     target_token = int(target_token_id)
-    with torch.no_grad():
-        base_embeds = model.get_input_embeddings()(input_ids)
-        base_logits = model(inputs_embeds=base_embeds, use_cache=False).logits[0, pred_pos, :]
-        base_log_prob = torch.log_softmax(base_logits, dim=-1)[target_token]
+    model_dtype = model.get_input_embeddings().weight.dtype
+    embeds = model.get_input_embeddings()(input_ids).detach().to(model_dtype)
+    embeds.requires_grad_(True)
+    logits = model(inputs_embeds=embeds, use_cache=False).logits[0, pred_pos, :].to(torch.float32)
+    log_prob = F.log_softmax(logits, dim=-1)[target_token]
+    grad = torch.autograd.grad(log_prob, embeds, create_graph=True)[0]
 
-    plus_embeds = base_embeds.clone()
-    minus_embeds = base_embeds.clone()
-    eps = float(max(epsilon, 1e-4))
-    for pos in range(seq_len):
-        with torch.no_grad():
-            base_vec = base_embeds[:, pos, :]
-            norm = torch.norm(base_vec, dim=-1, keepdim=True).clamp(min=1e-6)
-            delta = (eps * base_vec / norm).to(base_embeds.dtype)
-            plus_embeds[:, pos, :] = base_vec + delta
-            minus_embeds[:, pos, :] = base_vec - delta
+    accum = torch.zeros_like(embeds, dtype=torch.float32)
+    for k in range(int(num_samples)):
+        r = torch.randint_like(embeds, low=0, high=2, dtype=torch.int32).to(model_dtype)
+        r = r * 2 - 1  # Rademacher {+1,-1}
+        hvp = torch.autograd.grad(
+            (grad * r).sum(),
+            embeds,
+            retain_graph=(k < int(num_samples) - 1),
+            create_graph=False,
+        )[0]
+        accum = accum + (hvp.to(torch.float32) * r.to(torch.float32)).abs()
 
-            plus_logits = model(inputs_embeds=plus_embeds, use_cache=False).logits[0, pred_pos, :]
-            minus_logits = model(inputs_embeds=minus_embeds, use_cache=False).logits[
-                0, pred_pos, :
-            ]
-            lp_plus = torch.log_softmax(plus_logits, dim=-1)[target_token]
-            lp_minus = torch.log_softmax(minus_logits, dim=-1)[target_token]
-            second_order = torch.abs(lp_plus - 2 * base_log_prob + lp_minus) / (eps ** 2)
-            scores[pos] = second_order.to(torch.float32)
-
-            plus_embeds[:, pos, :] = base_vec
-            minus_embeds[:, pos, :] = base_vec
-
+    scores = accum.sum(dim=-1).squeeze(0).to(torch.float32) / float(num_samples)
+    scores[pred_pos + 1 :] = 0
     total = scores.sum()
     if total > 1e-10:
         scores = scores / total
@@ -301,11 +546,34 @@ def combine_attr(
     kl_i: np.ndarray,
     beta: float,
     gamma: float,
+    fusion_mode: str = "paper",
+    mt_floor: float = 0.0,
 ) -> np.ndarray:
     mt = np.clip(np.asarray(mt_gate, dtype=np.float64), 0.0, None)
     s = np.clip(np.asarray(hessian_s, dtype=np.float64), 0.0, None)
     i = np.clip(np.asarray(kl_i, dtype=np.float64), 0.0, None)
-    final = mt * (beta * s + gamma * i)
+
+    mode = (fusion_mode or "paper").strip().lower()
+    if mode == "log":
+        eps = 1e-12
+        floor = max(0.0, float(mt_floor))
+        mt_safe = np.maximum(mt, floor)
+        s_safe = np.maximum(s, eps)
+        i_safe = np.maximum(i, eps)
+        logits = np.log(mt_safe + eps) + float(beta) * np.log(s_safe) + float(gamma) * np.log(i_safe)
+        logits = logits - np.max(logits)
+        exp_logits = np.exp(logits)
+        denom = exp_logits.sum()
+        if denom > 1e-12:
+            final = exp_logits / denom
+        else:
+            final = np.zeros_like(exp_logits, dtype=np.float64)
+    elif mode == "paper_floor":
+        floor = max(0.0, float(mt_floor))
+        final = np.maximum(mt, floor) * (beta * s + gamma * i)
+    else:
+        final = mt * (beta * s + gamma * i)
+
     normalizer = final.sum()
     if normalizer > 1e-12:
         final = final / normalizer
@@ -367,6 +635,11 @@ def run_one_example(
     gamma: float,
     masking: str,
     quality: str,
+    hvp_samples: int = DEFAULT_HVP_SAMPLES,
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+    answer_text: str = "",
+    fusion_mode: str = "paper",
+    mt_floor: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Run one end-to-end attribution request using the backend flow from gradio_app.py.
@@ -378,32 +651,80 @@ def run_one_example(
     tokenizer = load_tokenizer(model_id)
     attributor = load_attributor(model_id)
     prompt_bundle = build_segmented_prompt(narrative, evidence, question, tokenizer)
-    full_text = prompt_bundle["full_text"]
-    prompt_ids = tokenizer(full_text, add_special_tokens=False).input_ids
+    base_prompt_text = prompt_bundle["full_text"]
+    generation_prompt_text = f"{base_prompt_text}{ANSWER_CUE}"
+    prompt_ids = tokenizer(generation_prompt_text, add_special_tokens=False).input_ids
 
-    answer_bundle = generate_answer_tokens(attributor.model, tokenizer, full_text)
+    answer_bundle = generate_answer_tokens(attributor.model, tokenizer, generation_prompt_text)
     answer_ids = answer_bundle["answer_token_ids"]
     answer_tokens = answer_bundle["answer_tokens"]
     if not answer_ids:
         raise RuntimeError("Generation produced no answer tokens.")
 
-    k = int(target_k) if target_k is not None else 1
-    k = max(1, min(k, len(answer_ids)))
+    requested_k = int(target_k) if target_k is not None else 1
+    requested_k = max(1, requested_k)
+    generated_k = max(1, min(requested_k, len(answer_ids)))
+    if requested_k == 1:
+        generated_k = _first_generated_content_index(answer_tokens) + 1
+    generated_target_token_id = int(answer_ids[generated_k - 1])
+
+    target_source = "generated"
+    target_token_id = generated_target_token_id
+    if requested_k == 1:
+        gold_target_token_id = _first_gold_answer_token_id(tokenizer, answer_text)
+        if gold_target_token_id is not None:
+            target_token_id = int(gold_target_token_id)
+            target_source = "gold_answer"
+
+    k = generated_k
 
     context_ids = prompt_ids + answer_ids[: k - 1]
-    target_token_id = int(answer_ids[k - 1])
+    original_context_len = len(context_ids)
+    truncated_tokens = 0
+    segment_ranges = {
+        "narrative": tuple(prompt_bundle["segments"]["narrative"]),
+        "evidence": tuple(prompt_bundle["segments"]["evidence"]),
+        "question": tuple(prompt_bundle["segments"]["question"]),
+    }
+    if max_context_tokens and len(context_ids) > int(max_context_tokens):
+        keep = int(max_context_tokens)
+        truncated_tokens = len(context_ids) - keep
+        context_ids = context_ids[-keep:]
+
+        shifted_ranges: Dict[str, Tuple[int, int]] = {}
+        for name, (start, end) in segment_ranges.items():
+            new_start = max(0, int(start) - truncated_tokens)
+            new_end = max(0, int(end) - truncated_tokens)
+            new_start = min(new_start, keep)
+            new_end = min(new_end, keep)
+            if new_end < new_start:
+                new_end = new_start
+            shifted_ranges[name] = (new_start, new_end)
+        segment_ranges = shifted_ranges
+
     input_ids = torch.tensor([context_ids], dtype=torch.long, device=attributor.device)
     logical_target_pos = len(context_ids)
+    pred_pos = max(0, input_ids.shape[1] - 1)
 
-    mt_target_idx = max(0, input_ids.shape[1] - 1)
-    mt_gate = (
-        attributor.compute_attention_rollout(input_ids, mt_target_idx)
-        .to(torch.float32)
-        .detach()
-        .cpu()
-        .numpy()
+    mt_input_ids = torch.tensor(
+        [context_ids + [target_token_id]],
+        dtype=torch.long,
+        device=attributor.device,
     )
-    hessian_s = compute_hessian_sensitivity_forward(attributor.model, input_ids, target_token_id)
+    mt_gate_full = compute_semantic_flow_mt(
+        attributor.model,
+        mt_input_ids,
+        target_pos=len(context_ids),
+        target_token_id=target_token_id,
+    )
+    mt_gate = mt_gate_full[: len(context_ids)]
+    hessian_s = compute_hessian_sensitivity_hvp(
+        attributor.model,
+        input_ids,
+        target_token_id=target_token_id,
+        pred_pos=pred_pos,
+        num_samples=max(1, int(hvp_samples)),
+    )
     kl_i = compute_kl_information(
         attributor.model,
         tokenizer,
@@ -412,28 +733,52 @@ def run_one_example(
         masking,
     )
 
-    content_indices = _build_content_indices(
-        prompt_bundle["segments"], prompt_len=len(prompt_ids), context_len=len(context_ids)
+    paragraph_indices = _build_content_indices(
+        {
+            "narrative": segment_ranges.get("narrative", (0, 0)),
+            "evidence": segment_ranges.get("evidence", (0, 0)),
+        },
+        prompt_len=max(0, len(prompt_ids) - truncated_tokens),
+        context_len=len(context_ids),
     )
-    mt_gate = normalize_on_indices(mt_gate, content_indices)
-    hessian_s = normalize_on_indices(hessian_s, content_indices)
-    kl_i = normalize_on_indices(kl_i, content_indices)
-    final_scores = combine_attr(mt_gate, hessian_s, kl_i, float(beta), float(gamma))
-    final_scores = normalize_on_indices(final_scores, content_indices)
+    norm_indices = paragraph_indices
+    if not norm_indices:
+        norm_indices = _build_content_indices(
+            segment_ranges,
+            prompt_len=max(0, len(prompt_ids) - truncated_tokens),
+            context_len=len(context_ids),
+        )
+
+    mt_gate = normalize_on_indices(mt_gate, norm_indices)
+    hessian_s = normalize_on_indices(hessian_s, norm_indices)
+    kl_i = normalize_on_indices(kl_i, norm_indices)
+    final_scores = combine_attr(
+        mt_gate,
+        hessian_s,
+        kl_i,
+        float(beta),
+        float(gamma),
+        fusion_mode=fusion_mode,
+        mt_floor=float(mt_floor),
+    )
+    final_scores = normalize_on_indices(final_scores, norm_indices)
 
     tokens = [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in context_ids]
-    segment_mass = _segment_mass_abs(final_scores, prompt_bundle["segments"])
+    segment_mass = _segment_mass_abs(final_scores, segment_ranges)
 
     return {
-        "prompt_full_text": full_text,
+        "prompt_full_text": generation_prompt_text,
+        "prompt_base_text": base_prompt_text,
         "tokens": tokens,
         "answer_tokens": answer_tokens,
-        "onset_token_text": answer_tokens[k - 1],
-        "target_k": int(k),
+        "onset_token_text": tokenizer.decode([target_token_id], skip_special_tokens=False),
+        "generated_onset_token_text": answer_tokens[k - 1],
+        "target_k": int(requested_k),
+        "generated_target_k": int(k),
         "segment_token_spans": {
-            "narrative": list(prompt_bundle["segments"]["narrative"]),
-            "evidence": list(prompt_bundle["segments"]["evidence"]),
-            "question": list(prompt_bundle["segments"]["question"]),
+            "narrative": list(segment_ranges["narrative"]),
+            "evidence": list(segment_ranges["evidence"]),
+            "question": list(segment_ranges["question"]),
         },
         "component_scores": {
             "MT": [float(x) for x in mt_gate.tolist()],
@@ -449,6 +794,18 @@ def run_one_example(
             "gamma": float(gamma),
             "masking": masking,
             "quality": quality,
+            "mt_variant": "target_answer_rollout_headwise_value_projection",
+            "s_variant": "hvp_hutchinson",
+            "s_hvp_samples": int(max(1, int(hvp_samples))),
+            "max_context_tokens": int(max_context_tokens),
+            "original_context_len": int(original_context_len),
+            "truncated_tokens": int(truncated_tokens),
+            "segment_norm_scope": "paragraph_only",
+            "target_source": target_source,
+            "generated_target_token_id": int(generated_target_token_id),
+            "target_token_id": int(target_token_id),
+            "fusion_mode": str(fusion_mode),
+            "mt_floor": float(mt_floor),
         },
     }
 
