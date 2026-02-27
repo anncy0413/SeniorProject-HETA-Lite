@@ -18,6 +18,11 @@ DEFAULT_MODEL_LABEL = next(iter(MODEL_OPTIONS.keys()))
 DEFAULT_MODEL_ID = MODEL_OPTIONS[DEFAULT_MODEL_LABEL]
 DEFAULT_HVP_SAMPLES = 1
 DEFAULT_MAX_CONTEXT_TOKENS = 384
+DEFAULT_PACKING_MODE = "evidence_first"
+DEFAULT_NARRATIVE_CAP_RATIO = 1.0
+DEFAULT_NARRATIVE_CAP_MIN = 32
+DEFAULT_NARRATIVE_CAP_MAX = 192
+DEFAULT_QUESTION_MIN_TOKENS = 24
 ANSWER_CUE = "\nAnswer:"
 
 
@@ -222,6 +227,301 @@ def build_segmented_prompt(
     return {
         "full_text": full_text,
         "segments": spans,
+    }
+
+
+def _encode_segment_token_parts(
+    tokenizer: AutoTokenizer, tag: str, content: str
+) -> Tuple[List[int], List[int], List[int]]:
+    marker_ids = tokenizer(tag, add_special_tokens=False).input_ids
+    clean_content = (content or "").strip()
+    content_ids = (
+        tokenizer(f" {clean_content}", add_special_tokens=False).input_ids
+        if clean_content
+        else []
+    )
+    return marker_ids, content_ids, marker_ids + content_ids
+
+
+def _build_segment_ranges(
+    narrative_marker_ids: List[int],
+    narrative_content_ids: List[int],
+    evidence_marker_ids: List[int],
+    evidence_content_ids: List[int],
+    question_marker_ids: List[int],
+    question_content_ids: List[int],
+    sep_ids: List[int],
+) -> Dict[str, Tuple[int, int]]:
+    narrative_start = len(narrative_marker_ids)
+    narrative_end = narrative_start + len(narrative_content_ids)
+
+    evidence_offset = len(narrative_marker_ids) + len(narrative_content_ids) + len(sep_ids)
+    evidence_start = evidence_offset + len(evidence_marker_ids)
+    evidence_end = evidence_start + len(evidence_content_ids)
+
+    question_offset = evidence_offset + len(evidence_marker_ids) + len(evidence_content_ids) + len(
+        sep_ids
+    )
+    question_start = question_offset + len(question_marker_ids)
+    question_end = question_start + len(question_content_ids)
+
+    return {
+        "narrative": (int(narrative_start), int(narrative_end)),
+        "evidence": (int(evidence_start), int(evidence_end)),
+        "question": (int(question_start), int(question_end)),
+    }
+
+
+def _segment_coverage_from_ranges(
+    ranges: Dict[str, Tuple[int, int]],
+    original_counts: Dict[str, int],
+    context_len: int,
+) -> Dict[str, float]:
+    coverage: Dict[str, float] = {}
+    for name in ("narrative", "evidence", "question"):
+        start, end = ranges.get(name, (0, 0))
+        lo = max(0, int(start))
+        hi = min(int(context_len), int(end))
+        kept = max(0, hi - lo)
+        orig = max(0, int(original_counts.get(name, 0)))
+        coverage[name] = float(kept / orig) if orig > 0 else 1.0
+    return coverage
+
+
+def _pack_context_ids(
+    tokenizer: AutoTokenizer,
+    narrative: str,
+    evidence: str,
+    question: str,
+    answer_prefix_ids: List[int],
+    max_context_tokens: int,
+    packing_mode: str,
+    narrative_cap_ratio: float,
+    narrative_cap_min: int,
+    narrative_cap_max: int,
+    question_min_tokens: int,
+) -> Dict[str, Any]:
+    sep_ids = tokenizer(SEGMENT_SEPARATOR, add_special_tokens=False).input_ids
+    cue_ids = tokenizer(ANSWER_CUE, add_special_tokens=False).input_ids
+
+    n_marker, n_content, n_full = _encode_segment_token_parts(
+        tokenizer, "[NarrativeQA]", narrative
+    )
+    e_marker, e_content, e_full = _encode_segment_token_parts(tokenizer, "[SciQ]", evidence)
+    q_marker, q_content, q_full = _encode_segment_token_parts(tokenizer, "[Question]", question)
+
+    full_prompt_ids = n_full + sep_ids + e_full + sep_ids + q_full + cue_ids
+    full_context_ids = full_prompt_ids + list(answer_prefix_ids)
+    full_ranges = _build_segment_ranges(
+        n_marker,
+        n_content,
+        e_marker,
+        e_content,
+        q_marker,
+        q_content,
+        sep_ids,
+    )
+    original_counts = {
+        "narrative": len(n_content),
+        "evidence": len(e_content),
+        "question": len(q_content),
+    }
+
+    keep = int(max_context_tokens)
+    if keep <= 0 or len(full_context_ids) <= keep:
+        coverage = _segment_coverage_from_ranges(full_ranges, original_counts, len(full_context_ids))
+        return {
+            "context_ids": full_context_ids,
+            "prompt_token_count": len(full_prompt_ids),
+            "segment_ranges": full_ranges,
+            "segment_counts_original": original_counts,
+            "segment_counts_kept": {
+                "narrative": len(n_content),
+                "evidence": len(e_content),
+                "question": len(q_content),
+            },
+            "segment_coverage": coverage,
+            "truncated_tokens": 0,
+            "original_context_len": len(full_context_ids),
+            "context_packing": "full",
+            "valid_context": bool(
+                coverage["evidence"] >= 0.999 and coverage["question"] > 0.0
+            ),
+        }
+
+    mode = (packing_mode or DEFAULT_PACKING_MODE).strip().lower()
+    if mode not in {"evidence_first", "tail"}:
+        mode = DEFAULT_PACKING_MODE
+
+    if mode == "tail":
+        context_ids = full_context_ids[-keep:]
+        truncated = len(full_context_ids) - len(context_ids)
+        shifted_ranges: Dict[str, Tuple[int, int]] = {}
+        for name, (start, end) in full_ranges.items():
+            new_start = max(0, int(start) - truncated)
+            new_end = max(0, int(end) - truncated)
+            new_start = min(new_start, len(context_ids))
+            new_end = min(new_end, len(context_ids))
+            if new_end < new_start:
+                new_end = new_start
+            shifted_ranges[name] = (new_start, new_end)
+        coverage = _segment_coverage_from_ranges(shifted_ranges, original_counts, len(context_ids))
+        kept_counts = {
+            "narrative": max(0, shifted_ranges["narrative"][1] - shifted_ranges["narrative"][0]),
+            "evidence": max(0, shifted_ranges["evidence"][1] - shifted_ranges["evidence"][0]),
+            "question": max(0, shifted_ranges["question"][1] - shifted_ranges["question"][0]),
+        }
+        prompt_len_after_tail = max(0, len(full_prompt_ids) - truncated)
+        return {
+            "context_ids": context_ids,
+            "prompt_token_count": prompt_len_after_tail,
+            "segment_ranges": shifted_ranges,
+            "segment_counts_original": original_counts,
+            "segment_counts_kept": kept_counts,
+            "segment_coverage": coverage,
+            "truncated_tokens": truncated,
+            "original_context_len": len(full_context_ids),
+            "context_packing": "tail",
+            "valid_context": bool(
+                coverage["evidence"] >= 0.999 and coverage["question"] > 0.0
+            ),
+        }
+
+    fixed_len = (
+        len(n_marker)
+        + len(sep_ids)
+        + len(e_marker)
+        + len(sep_ids)
+        + len(q_marker)
+        + len(cue_ids)
+        + len(answer_prefix_ids)
+    )
+    if fixed_len >= keep:
+        context_ids = full_context_ids[-keep:]
+        truncated = len(full_context_ids) - len(context_ids)
+        shifted_ranges = {}
+        for name, (start, end) in full_ranges.items():
+            new_start = max(0, int(start) - truncated)
+            new_end = max(0, int(end) - truncated)
+            new_start = min(new_start, len(context_ids))
+            new_end = min(new_end, len(context_ids))
+            if new_end < new_start:
+                new_end = new_start
+            shifted_ranges[name] = (new_start, new_end)
+        coverage = _segment_coverage_from_ranges(shifted_ranges, original_counts, len(context_ids))
+        kept_counts = {
+            "narrative": max(0, shifted_ranges["narrative"][1] - shifted_ranges["narrative"][0]),
+            "evidence": max(0, shifted_ranges["evidence"][1] - shifted_ranges["evidence"][0]),
+            "question": max(0, shifted_ranges["question"][1] - shifted_ranges["question"][0]),
+        }
+        prompt_len_after_tail = max(0, len(full_prompt_ids) - truncated)
+        return {
+            "context_ids": context_ids,
+            "prompt_token_count": prompt_len_after_tail,
+            "segment_ranges": shifted_ranges,
+            "segment_counts_original": original_counts,
+            "segment_counts_kept": kept_counts,
+            "segment_coverage": coverage,
+            "truncated_tokens": truncated,
+            "original_context_len": len(full_context_ids),
+            "context_packing": "tail_fallback",
+            "valid_context": bool(
+                coverage["evidence"] >= 0.999 and coverage["question"] > 0.0
+            ),
+        }
+
+    avail = keep - fixed_len
+    reserve_q = min(len(q_content), max(0, int(question_min_tokens)))
+    e_keep_len = min(len(e_content), max(0, avail - reserve_q))
+    avail_after_e = avail - e_keep_len
+    q_keep_len = min(len(q_content), max(0, avail_after_e))
+    if q_keep_len < reserve_q and e_keep_len > 0:
+        need = reserve_q - q_keep_len
+        give_back = min(need, e_keep_len)
+        e_keep_len -= give_back
+        q_keep_len += give_back
+        avail_after_e += give_back
+
+    avail_after_eq = avail - e_keep_len - q_keep_len
+    e_keep = e_content[:e_keep_len]
+    q_keep = q_content[:q_keep_len]
+
+    dynamic_cap = int(max(float(narrative_cap_min), float(narrative_cap_ratio) * max(1, e_keep_len)))
+    dynamic_cap = min(dynamic_cap, int(max(0, narrative_cap_max)))
+    n_keep_len = min(len(n_content), max(0, dynamic_cap), max(0, avail_after_eq))
+    n_keep = n_content[-n_keep_len:] if n_keep_len > 0 else []
+
+    n_full_keep = n_marker + n_keep
+    e_full_keep = e_marker + e_keep
+    q_full_keep = q_marker + q_keep
+    prompt_context_ids = n_full_keep + sep_ids + e_full_keep + sep_ids + q_full_keep + cue_ids
+    context_ids = prompt_context_ids + list(answer_prefix_ids)
+
+    # Final guardrail in case the heuristic still overshoots.
+    if len(context_ids) > keep:
+        context_ids = context_ids[-keep:]
+        truncated = len(full_context_ids) - len(context_ids)
+        shifted_ranges = {}
+        for name, (start, end) in full_ranges.items():
+            new_start = max(0, int(start) - truncated)
+            new_end = max(0, int(end) - truncated)
+            new_start = min(new_start, len(context_ids))
+            new_end = min(new_end, len(context_ids))
+            if new_end < new_start:
+                new_end = new_start
+            shifted_ranges[name] = (new_start, new_end)
+        coverage = _segment_coverage_from_ranges(shifted_ranges, original_counts, len(context_ids))
+        kept_counts = {
+            "narrative": max(0, shifted_ranges["narrative"][1] - shifted_ranges["narrative"][0]),
+            "evidence": max(0, shifted_ranges["evidence"][1] - shifted_ranges["evidence"][0]),
+            "question": max(0, shifted_ranges["question"][1] - shifted_ranges["question"][0]),
+        }
+        prompt_len_after_tail = max(0, len(full_prompt_ids) - truncated)
+        return {
+            "context_ids": context_ids,
+            "prompt_token_count": prompt_len_after_tail,
+            "segment_ranges": shifted_ranges,
+            "segment_counts_original": original_counts,
+            "segment_counts_kept": kept_counts,
+            "segment_coverage": coverage,
+            "truncated_tokens": truncated,
+            "original_context_len": len(full_context_ids),
+            "context_packing": "evidence_first_tail_guardrail",
+            "valid_context": bool(
+                coverage["evidence"] >= 0.999 and coverage["question"] > 0.0
+            ),
+        }
+
+    kept_ranges = _build_segment_ranges(
+        n_marker,
+        n_keep,
+        e_marker,
+        e_keep,
+        q_marker,
+        q_keep,
+        sep_ids,
+    )
+    kept_counts = {
+        "narrative": len(n_keep),
+        "evidence": len(e_keep),
+        "question": len(q_keep),
+    }
+    coverage = {
+        name: (float(kept_counts[name] / original_counts[name]) if original_counts[name] > 0 else 1.0)
+        for name in ("narrative", "evidence", "question")
+    }
+    truncated = len(full_context_ids) - len(context_ids)
+    return {
+        "context_ids": context_ids,
+        "prompt_token_count": len(prompt_context_ids),
+        "segment_ranges": kept_ranges,
+        "segment_counts_original": original_counts,
+        "segment_counts_kept": kept_counts,
+        "segment_coverage": coverage,
+        "truncated_tokens": max(0, truncated),
+        "original_context_len": len(full_context_ids),
+        "context_packing": "evidence_first",
+        "valid_context": bool(coverage["evidence"] >= 0.999 and coverage["question"] > 0.0),
     }
 
 
@@ -640,6 +940,12 @@ def run_one_example(
     answer_text: str = "",
     fusion_mode: str = "paper",
     mt_floor: float = 0.0,
+    target_source_mode: str = "generated",
+    packing_mode: str = DEFAULT_PACKING_MODE,
+    narrative_cap_ratio: float = DEFAULT_NARRATIVE_CAP_RATIO,
+    narrative_cap_min: int = DEFAULT_NARRATIVE_CAP_MIN,
+    narrative_cap_max: int = DEFAULT_NARRATIVE_CAP_MAX,
+    question_min_tokens: int = DEFAULT_QUESTION_MIN_TOKENS,
 ) -> Dict[str, Any]:
     """
     Run one end-to-end attribution request using the backend flow from gradio_app.py.
@@ -653,7 +959,6 @@ def run_one_example(
     prompt_bundle = build_segmented_prompt(narrative, evidence, question, tokenizer)
     base_prompt_text = prompt_bundle["full_text"]
     generation_prompt_text = f"{base_prompt_text}{ANSWER_CUE}"
-    prompt_ids = tokenizer(generation_prompt_text, add_special_tokens=False).input_ids
 
     answer_bundle = generate_answer_tokens(attributor.model, tokenizer, generation_prompt_text)
     answer_ids = answer_bundle["answer_token_ids"]
@@ -668,39 +973,43 @@ def run_one_example(
         generated_k = _first_generated_content_index(answer_tokens) + 1
     generated_target_token_id = int(answer_ids[generated_k - 1])
 
+    source_mode = (target_source_mode or "generated").strip().lower()
+    if source_mode not in {"generated", "gold_answer", "auto"}:
+        source_mode = "generated"
     target_source = "generated"
     target_token_id = generated_target_token_id
-    if requested_k == 1:
+    if requested_k == 1 and source_mode in {"gold_answer", "auto"}:
         gold_target_token_id = _first_gold_answer_token_id(tokenizer, answer_text)
         if gold_target_token_id is not None:
             target_token_id = int(gold_target_token_id)
             target_source = "gold_answer"
+    if source_mode == "gold_answer" and target_source != "gold_answer":
+        target_source = "generated_fallback"
 
     k = generated_k
 
-    context_ids = prompt_ids + answer_ids[: k - 1]
-    original_context_len = len(context_ids)
-    truncated_tokens = 0
+    pack_info = _pack_context_ids(
+        tokenizer=tokenizer,
+        narrative=narrative,
+        evidence=evidence,
+        question=question,
+        answer_prefix_ids=answer_ids[: k - 1],
+        max_context_tokens=int(max_context_tokens),
+        packing_mode=packing_mode,
+        narrative_cap_ratio=float(narrative_cap_ratio),
+        narrative_cap_min=int(narrative_cap_min),
+        narrative_cap_max=int(narrative_cap_max),
+        question_min_tokens=int(question_min_tokens),
+    )
+    context_ids = list(pack_info["context_ids"])
+    original_context_len = int(pack_info["original_context_len"])
+    truncated_tokens = int(pack_info["truncated_tokens"])
+    prompt_token_count = int(pack_info["prompt_token_count"])
     segment_ranges = {
-        "narrative": tuple(prompt_bundle["segments"]["narrative"]),
-        "evidence": tuple(prompt_bundle["segments"]["evidence"]),
-        "question": tuple(prompt_bundle["segments"]["question"]),
+        "narrative": tuple(pack_info["segment_ranges"]["narrative"]),
+        "evidence": tuple(pack_info["segment_ranges"]["evidence"]),
+        "question": tuple(pack_info["segment_ranges"]["question"]),
     }
-    if max_context_tokens and len(context_ids) > int(max_context_tokens):
-        keep = int(max_context_tokens)
-        truncated_tokens = len(context_ids) - keep
-        context_ids = context_ids[-keep:]
-
-        shifted_ranges: Dict[str, Tuple[int, int]] = {}
-        for name, (start, end) in segment_ranges.items():
-            new_start = max(0, int(start) - truncated_tokens)
-            new_end = max(0, int(end) - truncated_tokens)
-            new_start = min(new_start, keep)
-            new_end = min(new_end, keep)
-            if new_end < new_start:
-                new_end = new_start
-            shifted_ranges[name] = (new_start, new_end)
-        segment_ranges = shifted_ranges
 
     input_ids = torch.tensor([context_ids], dtype=torch.long, device=attributor.device)
     logical_target_pos = len(context_ids)
@@ -738,14 +1047,14 @@ def run_one_example(
             "narrative": segment_ranges.get("narrative", (0, 0)),
             "evidence": segment_ranges.get("evidence", (0, 0)),
         },
-        prompt_len=max(0, len(prompt_ids) - truncated_tokens),
+        prompt_len=max(0, prompt_token_count),
         context_len=len(context_ids),
     )
     norm_indices = paragraph_indices
     if not norm_indices:
         norm_indices = _build_content_indices(
             segment_ranges,
-            prompt_len=max(0, len(prompt_ids) - truncated_tokens),
+            prompt_len=max(0, prompt_token_count),
             context_len=len(context_ids),
         )
 
@@ -770,6 +1079,7 @@ def run_one_example(
         "prompt_full_text": generation_prompt_text,
         "prompt_base_text": base_prompt_text,
         "tokens": tokens,
+        "context_token_ids": [int(x) for x in context_ids],
         "answer_tokens": answer_tokens,
         "onset_token_text": tokenizer.decode([target_token_id], skip_special_tokens=False),
         "generated_onset_token_text": answer_tokens[k - 1],
@@ -800,12 +1110,35 @@ def run_one_example(
             "max_context_tokens": int(max_context_tokens),
             "original_context_len": int(original_context_len),
             "truncated_tokens": int(truncated_tokens),
+            "context_packing": str(pack_info["context_packing"]),
+            "valid_context": bool(pack_info["valid_context"]),
+            "segment_counts_original": {
+                "narrative": int(pack_info["segment_counts_original"]["narrative"]),
+                "evidence": int(pack_info["segment_counts_original"]["evidence"]),
+                "question": int(pack_info["segment_counts_original"]["question"]),
+            },
+            "segment_counts_kept": {
+                "narrative": int(pack_info["segment_counts_kept"]["narrative"]),
+                "evidence": int(pack_info["segment_counts_kept"]["evidence"]),
+                "question": int(pack_info["segment_counts_kept"]["question"]),
+            },
+            "segment_coverage": {
+                "narrative": float(pack_info["segment_coverage"]["narrative"]),
+                "evidence": float(pack_info["segment_coverage"]["evidence"]),
+                "question": float(pack_info["segment_coverage"]["question"]),
+            },
             "segment_norm_scope": "paragraph_only",
             "target_source": target_source,
+            "target_source_mode": source_mode,
             "generated_target_token_id": int(generated_target_token_id),
             "target_token_id": int(target_token_id),
             "fusion_mode": str(fusion_mode),
             "mt_floor": float(mt_floor),
+            "packing_mode_requested": str(packing_mode),
+            "narrative_cap_ratio": float(narrative_cap_ratio),
+            "narrative_cap_min": int(narrative_cap_min),
+            "narrative_cap_max": int(narrative_cap_max),
+            "question_min_tokens": int(question_min_tokens),
         },
     }
 

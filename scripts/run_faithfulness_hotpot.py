@@ -721,9 +721,7 @@ def compute_removal_faithfulness(
     if len(sorted_keys) >= 2:
         xs = [float(k) for k in sorted_keys]
         ys = [drop_gap[k] for k in sorted_keys]
-        auc_gap = float(
-            np.trapezoid(np.asarray(ys, dtype=np.float64), np.asarray(xs, dtype=np.float64))
-        )
+        auc_gap = float(np.trapz(np.asarray(ys, dtype=np.float64), np.asarray(xs, dtype=np.float64)))
     elif len(sorted_keys) == 1:
         auc_gap = float(drop_gap[sorted_keys[0]] * float(sorted_keys[0]))
 
