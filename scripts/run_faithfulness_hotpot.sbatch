@@ -23,19 +23,13 @@ if [[ -z "${INPUT_JSONL}" || -z "${OUTPUT_DIR}" ]]; then
 fi
 
 MODEL_NAME="${MODEL_NAME:-}"
+MODE="${MODE:-fidelity}"
 BETA="${BETA:-0.5}"
 GAMMA="${GAMMA:-0.5}"
-MASKING="${MASKING:-zero_embed}"
-QUALITY="${QUALITY:-balanced}"
 TARGET_K="${TARGET_K:-1}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-500}"
 SEED="${SEED:-0}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
-HVP_SAMPLES="${HVP_SAMPLES:-1}"
-MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-384}"
-IMPORTANT_TOP_FRACTION="${IMPORTANT_TOP_FRACTION:-0.2}"
-FUSION_MODE="${FUSION_MODE:-log}"
-MT_FLOOR="${MT_FLOOR:-0.05}"
 
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -56,22 +50,16 @@ cd "${REPO_ROOT}"
 
 CMD=(
   python -u scripts/run_faithfulness_hotpot.py
+  --mode "${MODE}"
   --input_jsonl "${INPUT_JSONL}"
   --output_dir "${OUTPUT_DIR}"
   --beta "${BETA}"
   --gamma "${GAMMA}"
-  --masking "${MASKING}"
-  --quality "${QUALITY}"
   --target_k "${TARGET_K}"
   --max_examples "${MAX_EXAMPLES}"
   --seed "${SEED}"
   --num_workers 1
   --save_every "${SAVE_EVERY}"
-  --hvp_samples "${HVP_SAMPLES}"
-  --max_context_tokens "${MAX_CONTEXT_TOKENS}"
-  --important_top_fraction "${IMPORTANT_TOP_FRACTION}"
-  --fusion_mode "${FUSION_MODE}"
-  --mt_floor "${MT_FLOOR}"
 )
 
 if [[ -n "${MODEL_NAME}" ]]; then
