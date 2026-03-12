@@ -1312,10 +1312,19 @@ def main() -> None:
             one: Dict[str, Any] | None = None
             run_hvp_samples = effective_hvp_samples
             run_context_tokens = effective_context_tokens
-            attempt_plan: List[Tuple[int, int]] = [(run_hvp_samples, run_context_tokens)]
-            for fallback in ((1, min(run_context_tokens, 256)), (1, min(run_context_tokens, 192))):
-                if fallback not in attempt_plan:
-                    attempt_plan.append(fallback)
+            attempt_plan: List[Tuple[int, int]] = []
+            # Gradual context backoff keeps more evidence/question tokens than hard-jumping to 256.
+            context_candidates: List[int] = [run_context_tokens]
+            for c in (768, 512, 384, 256, 192):
+                if c < run_context_tokens:
+                    context_candidates.append(c)
+            seen_ctx: Set[int] = set()
+            for ctx in context_candidates:
+                ctx_i = max(64, int(ctx))
+                if ctx_i in seen_ctx:
+                    continue
+                seen_ctx.add(ctx_i)
+                attempt_plan.append((1, ctx_i))
 
             last_error: Exception | None = None
             for attempt_idx, (attempt_hvp, attempt_ctx) in enumerate(attempt_plan, start=1):

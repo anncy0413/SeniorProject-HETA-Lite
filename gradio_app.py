@@ -12,6 +12,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from heta_batch_runner import (
+    build_segmented_prompt as backend_build_segmented_prompt,
+    get_model_id as backend_get_model_id,
+    get_model_label as backend_get_model_label,
+    load_attributor as backend_load_attributor,
+    load_tokenizer as backend_load_tokenizer,
+    run_one_example,
+)
 from heta_demo import HETAAttributor
 
 MODEL_OPTIONS = {
@@ -35,6 +43,7 @@ MAX_TOKENS = 512
 TOP_K = 8
 SEGMENT_SEPARATOR = " <s> "
 MAX_ANSWER_TOKENS = 16
+QUALITY_CONTEXT_BUDGET = {"fast": 256, "balanced": 384, "accurate": 512}
 
 CURATED_EXAMPLE = {
     "narrative": (
@@ -482,44 +491,21 @@ def get_compute_dtype(device: str) -> torch.dtype:
 
 
 def get_model_id(model_choice: str) -> str:
-    if model_choice in MODEL_OPTIONS:
-        return MODEL_OPTIONS[model_choice]
-    if model_choice in MODEL_OPTIONS.values():
-        return model_choice
-    return DEFAULT_MODEL_ID
+    return backend_get_model_id(model_choice)
 
 
 def get_model_label(model_choice: str) -> str:
-    if model_choice in MODEL_OPTIONS:
-        return model_choice
-    for label, model_id in MODEL_OPTIONS.items():
-        if model_id == model_choice:
-            return label
-    return DEFAULT_MODEL_LABEL
+    return backend_get_model_label(model_choice)
 
 
 @lru_cache(maxsize=8)
 def load_tokenizer(model_name: str = DEFAULT_MODEL_ID) -> AutoTokenizer:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+    return backend_load_tokenizer(model_name)
 
 
 @lru_cache(maxsize=1)
 def load_attributor(model_name: str = DEFAULT_MODEL_ID) -> HETAAttributor:
-    device = get_device()
-    dtype = get_compute_dtype(device)
-    tokenizer = load_tokenizer(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-        attn_implementation="eager",
-    )
-    model.eval()
-    return HETAAttributor(model, tokenizer, device)
+    return backend_load_attributor(model_name)
 
 
 def sanitize_token(token: str) -> str:
@@ -577,84 +563,7 @@ def build_segmented_prompt(
 ) -> Dict[str, Any]:
     if tokenizer is None:
         tokenizer = load_tokenizer(DEFAULT_MODEL_ID)
-
-    narrative = (narrative or "").strip()
-    evidence = (evidence or "").strip()
-    question = (question or "").strip()
-    prefix_text = {
-        "narrative": "[NarrativeQA]",
-        "evidence": "[SciQ]",
-        "question": "[Question]",
-    }
-    segment_content = {
-        "narrative": narrative,
-        "evidence": evidence,
-        "question": question,
-    }
-    segment_text = {
-        key: (
-            "{} {}".format(prefix_text[key], segment_content[key]).strip()
-            if segment_content[key]
-            else prefix_text[key]
-        )
-        for key in prefix_text
-    }
-    full_text = SEGMENT_SEPARATOR.join(
-        [segment_text["narrative"], segment_text["evidence"], segment_text["question"]]
-    )
-
-    separator_ids = tokenizer(SEGMENT_SEPARATOR, add_special_tokens=False).input_ids
-    narrative_ids = tokenizer(
-        segment_text["narrative"], add_special_tokens=False
-    ).input_ids
-    evidence_ids = tokenizer(segment_text["evidence"], add_special_tokens=False).input_ids
-    question_ids = tokenizer(segment_text["question"], add_special_tokens=False).input_ids
-
-    narrative_prefix_ids = tokenizer(
-        "{} ".format(prefix_text["narrative"]), add_special_tokens=False
-    ).input_ids
-    evidence_prefix_ids = tokenizer(
-        "{} ".format(prefix_text["evidence"]), add_special_tokens=False
-    ).input_ids
-    question_prefix_ids = tokenizer(
-        "{} ".format(prefix_text["question"]), add_special_tokens=False
-    ).input_ids
-
-    narrative_content_ids = tokenizer(narrative, add_special_tokens=False).input_ids
-    evidence_content_ids = tokenizer(evidence, add_special_tokens=False).input_ids
-    question_content_ids = tokenizer(question, add_special_tokens=False).input_ids
-
-    narrative_segment_start = 0
-    narrative_segment_end = len(narrative_ids)
-    evidence_segment_start = len(narrative_ids) + len(separator_ids)
-    evidence_segment_end = evidence_segment_start + len(evidence_ids)
-    question_segment_start = evidence_segment_start + len(evidence_ids) + len(separator_ids)
-    question_segment_end = question_segment_start + len(question_ids)
-
-    narrative_start = narrative_segment_start + len(narrative_prefix_ids)
-    narrative_end = narrative_start + len(narrative_content_ids)
-
-    evidence_start = evidence_segment_start + len(evidence_prefix_ids)
-    evidence_end = evidence_start + len(evidence_content_ids)
-
-    question_start = question_segment_start + len(question_prefix_ids)
-    question_end = question_start + len(question_content_ids)
-
-    narrative_start = min(narrative_start, narrative_segment_end)
-    narrative_end = min(max(narrative_start, narrative_end), narrative_segment_end)
-    evidence_start = min(evidence_start, evidence_segment_end)
-    evidence_end = min(max(evidence_start, evidence_end), evidence_segment_end)
-    question_start = min(question_start, question_segment_end)
-    question_end = min(max(question_start, question_end), question_segment_end)
-
-    return {
-        "full_text": full_text,
-        "segments": {
-            "narrative": (narrative_start, narrative_end),
-            "evidence": (evidence_start, evidence_end),
-            "question": (question_start, question_end),
-        },
-    }
+    return backend_build_segmented_prompt(narrative, evidence, question, tokenizer)
 
 
 def generate_answer_tokens(
@@ -1268,11 +1177,13 @@ def run_attribution(
 
     model_id = get_model_id(model_choice)
     model_label = get_model_label(model_choice)
-    start = time.perf_counter()
+    quality_label = str(quality or "Balanced").strip()
+    quality_key = quality_label.lower()
+    if quality_key not in QUALITY_CONTEXT_BUDGET:
+        quality_key = "balanced"
 
     try:
         tokenizer = load_tokenizer(model_id)
-        attributor = load_attributor(model_id)
         prompt_bundle = build_segmented_prompt(narrative, evidence, question, tokenizer)
         prompt_ids = tokenizer(prompt_bundle["full_text"], add_special_tokens=False).input_ids
     except Exception as exc:  # noqa: BLE001
@@ -1290,96 +1201,61 @@ def run_attribution(
             ),
         )
 
-    answer_bundle = generate_answer_tokens(attributor.model, tokenizer, prompt_bundle["full_text"])
-    answer_ids = answer_bundle["answer_token_ids"]
-    answer_tokens = answer_bundle["answer_tokens"]
-    if not answer_ids:
-        return run_return(
-            segment_ranges=prompt_bundle["segments"],
-            full_prompt=prompt_bundle["full_text"],
-            status_text=format_status("error", "Generation produced no answer tokens."),
-        )
-
     try:
-        k = int(answer_token_k) if answer_token_k is not None else 1
+        requested_k = int(answer_token_k) if answer_token_k is not None else 1
     except (TypeError, ValueError):
-        k = 1
-    k = max(1, min(k, len(answer_ids)))
-
-    context_ids = prompt_ids + answer_ids[: k - 1]
-    target_token_id = int(answer_ids[k - 1])
-    input_ids = torch.tensor([context_ids], dtype=torch.long, device=attributor.device)
-    logical_target_pos = len(context_ids)
+        requested_k = 1
+    requested_k = max(1, requested_k)
 
     try:
-        mt_target_idx = max(0, input_ids.shape[1] - 1)
-        mt_gate = (
-            attributor.compute_attention_rollout(input_ids, mt_target_idx)
-            .to(torch.float32)
-            .detach()
-            .cpu()
-            .numpy()
+        one = run_one_example(
+            model_name=model_choice,
+            narrative=narrative,
+            evidence=evidence,
+            question=question,
+            target_k=requested_k,
+            beta=float(beta),
+            gamma=float(gamma),
+            masking=mask_strategy,
+            quality=quality_key,
+            hvp_samples=1,
+            max_context_tokens=QUALITY_CONTEXT_BUDGET[quality_key],
+            answer_text="",
+            fusion_mode="paper",
+            mt_floor=0.0,
+            target_source_mode="generated",
+            packing_mode="evidence_first",
+            narrative_cap_ratio=1.0,
+            narrative_cap_min=32,
+            narrative_cap_max=192,
+            question_min_tokens=24,
         )
     except Exception as exc:  # noqa: BLE001
         return run_return(
             segment_ranges=prompt_bundle["segments"],
             full_prompt=prompt_bundle["full_text"],
-            status_text=format_status("error", "MT computation failed: {}".format(exc)),
+            status_text=format_status("error", "Attribution failed: {}".format(exc)),
         )
 
-    # Anncy: Comment this demo uses forward-only finite-difference curvature to avoid backend
-    # backward dtype limitations; paper-grade Hessian estimators can be wired in backend later.
-    try:
-        hessian_s = compute_hessian_sensitivity_forward(
-            attributor.model, input_ids, target_token_id
-        )
-    except Exception as exc:  # noqa: BLE001
-        return run_return(
-            segment_ranges=prompt_bundle["segments"],
-            full_prompt=prompt_bundle["full_text"],
-            status_text=format_status("error", "Hessian S computation failed: {}".format(exc)),
-        )
+    context_tokens = list(one["tokens"])
+    target_token_text = str(one["onset_token_text"])
+    display_tokens = context_tokens + [target_token_text]
+    target_pos = len(context_tokens)
 
-    try:
-        kl_i = compute_kl_information(
-            attributor.model,
-            tokenizer,
-            input_ids,
-            logical_target_pos,
-            mask_strategy,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return run_return(
-            segment_ranges=prompt_bundle["segments"],
-            full_prompt=prompt_bundle["full_text"],
-            status_text=format_status("error", "KL I computation failed: {}".format(exc)),
-        )
-    content_indices: List[int] = []
-    for start, end in prompt_bundle["segments"].values():
-        lo = max(0, int(start))
-        hi = min(len(context_ids), int(end))
-        if hi > lo:
-            content_indices.extend(range(lo, hi))
-    if len(context_ids) > len(prompt_ids):
-        content_indices.extend(range(len(prompt_ids), len(context_ids)))
-    content_indices = sorted(set(content_indices))
+    mt_gate = np.asarray(one["component_scores"]["MT"], dtype=np.float64)
+    hessian_s = np.asarray(one["component_scores"]["S"], dtype=np.float64)
+    kl_i = np.asarray(one["component_scores"]["KL"], dtype=np.float64)
+    final_scores = np.asarray(one["component_scores"]["final"], dtype=np.float64)
 
-    mt_gate = normalize_on_indices(mt_gate, content_indices)
-    hessian_s = normalize_on_indices(hessian_s, content_indices)
-    kl_i = normalize_on_indices(kl_i, content_indices)
-    final_scores = combine_attr(mt_gate, hessian_s, kl_i, float(beta), float(gamma))
-    final_scores = normalize_on_indices(final_scores, content_indices)
-
-    display_ids = context_ids + [target_token_id]
-    target_pos = len(display_ids) - 1
-    mt_display = np.concatenate([mt_gate, np.array([0.0], dtype=np.float32)])
-    s_display = np.concatenate([hessian_s, np.array([0.0], dtype=np.float32)])
-    i_display = np.concatenate([kl_i, np.array([0.0], dtype=np.float32)])
+    mt_display = np.concatenate([mt_gate, np.array([0.0], dtype=np.float64)])
+    s_display = np.concatenate([hessian_s, np.array([0.0], dtype=np.float64)])
+    i_display = np.concatenate([kl_i, np.array([0.0], dtype=np.float64)])
     final_display = np.concatenate([final_scores, np.array([0.0], dtype=np.float64)])
 
-    display_tokens = [
-        tokenizer.decode([token_id], skip_special_tokens=False) for token_id in display_ids
-    ]
+    segment_ranges = {
+        key: tuple(value) for key, value in (one.get("segment_token_spans", {}) or {}).items()
+    }
+    content_indices = list(range(len(context_tokens)))
     preview_html = render_token_preview(display_tokens, target_pos)
     selected_text = format_selected(display_tokens, target_pos)
 
@@ -1389,7 +1265,7 @@ def run_attribution(
         final_display,
         None,
         tooltips=tooltip_map,
-        segment_ranges=prompt_bundle["segments"],
+        segment_ranges=segment_ranges,
         target_index=target_pos,
     )
     mt_strip = render_heatmap_strip(
@@ -1397,7 +1273,7 @@ def run_attribution(
         mt_display,
         None,
         tooltips={idx: {"MT": value} for idx, value in enumerate(mt_display.tolist())},
-        segment_ranges=prompt_bundle["segments"],
+        segment_ranges=segment_ranges,
         target_index=target_pos,
     )
     s_strip = render_heatmap_strip(
@@ -1405,7 +1281,7 @@ def run_attribution(
         s_display,
         None,
         tooltips={idx: {"S": value} for idx, value in enumerate(s_display.tolist())},
-        segment_ranges=prompt_bundle["segments"],
+        segment_ranges=segment_ranges,
         target_index=target_pos,
     )
     i_strip = render_heatmap_strip(
@@ -1413,7 +1289,7 @@ def run_attribution(
         i_display,
         None,
         tooltips={idx: {"I": value} for idx, value in enumerate(i_display.tolist())},
-        segment_ranges=prompt_bundle["segments"],
+        segment_ranges=segment_ranges,
         target_index=target_pos,
     )
 
@@ -1423,34 +1299,50 @@ def run_attribution(
         k=12,
         allowed_indices=content_indices,
     )
-    segment_mass = compute_segment_mass(final_display, prompt_bundle["segments"])
+    segment_mass = dict(one.get("segment_mass", {}))
+    segment_mass["alignment"] = float(
+        segment_mass.get("evidence", 0.0) - segment_mass.get("narrative", 0.0)
+    )
     segment_mass_md = format_segment_mass_markdown(segment_mass)
-    answer_tokens_html = render_answer_tokens(answer_tokens, k)
+    selected_answer_k = int(one.get("generated_target_k", one["target_k"]))
+    answer_tokens_html = render_answer_tokens(one["answer_tokens"], selected_answer_k)
 
-    latency_ms = int((time.perf_counter() - start) * 1000)
-    # Anncy: Comment quality selector will map to backend runtime knobs (sampling budget / layers).
-    metadata = "Model: {} | Quality: {} | Mask: {} | beta={:.2f} | gamma={:.2f} | Latency: {} ms".format(
-        model_label, quality, mask_strategy, float(beta), float(gamma), latency_ms
+    run_meta = one.get("run_meta", {}) or {}
+    latency_ms = int(run_meta.get("latency_ms", 0))
+    metadata = (
+        "Model: {} | Quality: {} | Mask: {} | beta={:.2f} | gamma={:.2f} | "
+        "Latency: {} ms | Ctx: {} | Truncated: {}"
+    ).format(
+        model_label,
+        quality_key.title(),
+        mask_strategy,
+        float(beta),
+        float(gamma),
+        latency_ms,
+        int(run_meta.get("max_context_tokens", QUALITY_CONTEXT_BUDGET[quality_key])),
+        int(run_meta.get("truncated_tokens", 0)),
     )
 
     export_payload = {
-        "full_prompt": prompt_bundle["full_text"],
+        "full_prompt": one.get("prompt_full_text", prompt_bundle["full_text"]),
+        "prompt_base_text": one.get("prompt_base_text", prompt_bundle["full_text"]),
         "segments": {
-            "narrative": list(prompt_bundle["segments"]["narrative"]),
-            "evidence": list(prompt_bundle["segments"]["evidence"]),
-            "question": list(prompt_bundle["segments"]["question"]),
+            "narrative": list(segment_ranges.get("narrative", (0, 0))),
+            "evidence": list(segment_ranges.get("evidence", (0, 0))),
+            "question": list(segment_ranges.get("question", (0, 0))),
         },
         "model": model_label,
-        "quality": quality,
+        "quality": quality_key,
         "mask_strategy": mask_strategy,
         "beta": float(beta),
         "gamma": float(gamma),
         "answer": {
-            "text": answer_bundle["answer_text"],
-            "tokens": answer_tokens,
-            "k": int(k),
-            "target_token": answer_tokens[k - 1],
-            "target_token_id": int(answer_ids[k - 1]),
+            "text": "".join(one.get("answer_tokens", [])),
+            "tokens": one.get("answer_tokens", []),
+            "k_requested": int(one["target_k"]),
+            "k_selected": selected_answer_k,
+            "target_token": target_token_text,
+            "target_token_id": int(run_meta.get("target_token_id", -1)),
         },
         "tokens": display_tokens,
         "scores": {
@@ -1460,23 +1352,30 @@ def run_attribution(
             "kl_i": [float(value) for value in i_display.tolist()],
         },
         "segment_mass": segment_mass,
+        "run_meta": run_meta,
         "latency_ms": latency_ms,
     }
 
-    status_detail = "Attribution complete for answer onset token k={}.".format(k)
+    valid_context = bool(run_meta.get("valid_context", True))
+    coverage = (run_meta.get("segment_coverage", {}) or {}).get("evidence", 1.0)
+    status_detail = "Attribution complete for generated token k={}.".format(selected_answer_k)
+    if not valid_context:
+        status_detail += " Evidence coverage dropped to {:.3f} after context packing.".format(
+            float(coverage)
+        )
     return run_return(
         tokens=display_tokens,
         final_scores=[float(value) for value in final_display.tolist()],
         mt_scores=[float(value) for value in mt_display.tolist()],
         s_scores=[float(value) for value in s_display.tolist()],
         kl_scores=[float(value) for value in i_display.tolist()],
-        segment_ranges=prompt_bundle["segments"],
-        full_prompt=prompt_bundle["full_text"],
+        segment_ranges=segment_ranges,
+        full_prompt=one.get("prompt_full_text", prompt_bundle["full_text"]),
         target_index=int(target_pos),
         token_preview_html=preview_html,
         selected_text=selected_text,
         answer_html=answer_tokens_html,
-        answer_k=int(k),
+        answer_k=selected_answer_k,
         final_html=final_strip,
         mt_html=mt_strip,
         s_html=s_strip,
